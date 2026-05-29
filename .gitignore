@@ -17,3 +17,13 @@
 
 # temp files
 *~
+
+# Compiled tee-rex binaries (incl. cross-compiled: tee-rex-<os>-<arch>)
+/tee-rex
+/tee-rex-*
+
+# JetBrains IDE files
+.idea/
+
+# Stray output dumps
+.output.txt

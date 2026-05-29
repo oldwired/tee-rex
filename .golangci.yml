@@ -1,0 +1,16 @@
+# golangci-lint configuration for tee-rex. Mirrors fvmux's setup:
+# enable the standard high-signal checks and silence the QF1xxx
+# stylistic refactor suggestions from staticcheck (tagged-switch
+# hints etc. — taste calls, not defects).
+
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  exclusions:
+    rules:
+      - linters: [staticcheck]
+        text: "^QF1"

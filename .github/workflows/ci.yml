@@ -1,0 +1,91 @@
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Minimal-by-default token scope. Every job in this workflow only
+# needs to read repo contents (checkout, run tests, fetch deps).
+# Explicit permissions block prevents GITHUB_TOKEN from inheriting
+# broader rights from repo/org defaults.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build + test on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  race:
+    # tee-rex_test.go is white-box and exercises the concurrent fanOut
+    # path, so the race detector is the job that actually matters here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+
+  cross-compile-windows:
+    name: cross-compile (windows/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Windows build
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # gofmt is non-fatal in go itself but a hard fail here — any
+      # unformatted file leaves a noisy diff for future contributors.
+      - name: gofmt
+        run: |
+          diff=$(gofmt -l -d .)
+          if [ -n "$diff" ]; then
+            echo "$diff"
+            echo
+            echo "Files above are not gofmt-clean. Run 'gofmt -w .' locally."
+            exit 1
+          fi
+
+      - name: golangci-lint
+        # golangci-lint-action v7+ is required for golangci-lint v2.x;
+        # v6 only supports v1.x and rejects "v2.*" version strings.
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.2
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      # govulncheck-action handles checkout + Go install internally.
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+          go-package: ./...

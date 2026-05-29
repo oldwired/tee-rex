@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# softprops/action-gh-release uploads assets to the GitHub release,
+# which requires write access to repo contents. Everything else this
+# workflow does (checkout, build, syft) only needs read, but the
+# upload step forces the wider scope. Pinning it explicitly keeps
+# the token from inheriting anything broader from repo/org defaults.
+permissions:
+  contents: write
+
+jobs:
+  # The verify-* jobs mirror ci.yml so the release gate fails on the
+  # same conditions a normal PR would. Duplication is intentional —
+  # the alternative (workflow_run, reusable workflows) adds indirection
+  # for a workflow that runs at most once per tag.
+
+  verify-test:
+    name: test on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  verify-race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+
+  verify-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          diff=$(gofmt -l -d .)
+          if [ -n "$diff" ]; then
+            echo "$diff"
+            echo
+            echo "Files above are not gofmt-clean. Run 'gofmt -w .' locally."
+            exit 1
+          fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.2
+
+  verify-vuln:
+    runs-on: ubuntu-latest
+    steps:
+      # govulncheck-action handles checkout + Go install internally.
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+          go-package: ./...
+
+  build-binaries:
+    name: build binary for ${{ matrix.os }}/${{ matrix.arch }}
+    needs: [verify-test, verify-race, verify-lint, verify-vuln]
+    runs-on: ubuntu-latest
+    strategy:
+      # fail-fast: false here is deliberate. A partial binary set never
+      # reaches the release (assemble-release needs every matrix entry),
+      # so killing surviving builds early just hides which platforms
+      # regressed.
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   arch: amd64 }
+          - { os: linux,   arch: arm64 }
+          - { os: darwin,  arch: amd64 }
+          - { os: darwin,  arch: arm64 }
+          - { os: windows, arch: amd64 }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        # -trimpath drops local paths from the binary; the ldflags stamp
+        # the same main.BuildCommit/BuildTime the Makefile uses, so
+        # `tee-rex -version` on a release asset reports the tagged build.
+        run: |
+          mkdir -p dist
+          ext=""
+          if [ "${{ matrix.os }}" = "windows" ]; then ext=".exe"; fi
+          go build -trimpath \
+            -ldflags "-X main.BuildCommit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o dist/tee-rex-${{ matrix.os }}-${{ matrix.arch }}${ext} .
+
+      # Stage binaries as workflow artifacts rather than uploading to
+      # the release directly — assemble-release downloads all of them
+      # so it can produce a single checksums.txt that covers the full
+      # set (and so the release stays empty if any platform fails).
+      - name: Stage binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          retention-days: 1
+          if-no-files-found: error
+
+  assemble-release:
+    name: assemble release
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # SBOM is generated from the source tree (go.mod drives the Go
+      # module catalogue — tee-rex is stdlib-only, so this is short).
+      # Done before downloading binaries so syft doesn't try to
+      # introspect them as separate artifacts.
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+      - name: Generate SBOM
+        run: syft scan dir:. -o spdx-json=tee-rex.spdx.json
+
+      - name: Collect binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      # tee-rex as a whole is licensed under AGPL-3.0 (LICENSE). NOTICE
+      # carries the upstream tcpmirror (Code Express) MIT notice verbatim,
+      # satisfying the MIT term that the copyright + permission notice
+      # travel with derived copies — without a second LICENSE-named file
+      # that could be misread as an alternative license to choose.
+      - name: Stage licenses
+        run: |
+          cp LICENSE dist/LICENSE
+          cp NOTICE dist/NOTICE
+
+      # sha256 over binaries + licenses + SBOM, but not over
+      # checksums.txt itself. Listing files explicitly avoids the
+      # self-reference and keeps the checksum set deterministic
+      # regardless of dist/ ordering.
+      - name: Generate checksums
+        run: |
+          mv tee-rex.spdx.json dist/
+          cd dist
+          sha256sum tee-rex-* LICENSE NOTICE tee-rex.spdx.json > checksums.txt
+          cat checksums.txt
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
