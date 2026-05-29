@@ -53,7 +53,7 @@ func tcpConnPair(t *testing.T) (client, server net.Conn) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	srvCh := make(chan net.Conn, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -267,8 +267,8 @@ func TestScaffolding(t *testing.T) {
 
 	// net.Pipe ends must support deadlines (relied on by later tests).
 	p1, p2 := net.Pipe()
-	defer p1.Close()
-	defer p2.Close()
+	defer func() { _ = p1.Close() }()
+	defer func() { _ = p2.Close() }()
 	if err := p1.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("net.Pipe SetReadDeadline: %v", err)
 	}
@@ -628,8 +628,8 @@ func TestCopyWithDeadlines(t *testing.T) {
 	})
 
 	t.Run("idle read timeout (src) is not wrapped", func(t *testing.T) {
-		p1, srcR := net.Pipe() // nothing is ever written to p1
-		defer p1.Close()       // closed only after copy returns
+		p1, srcR := net.Pipe()            // nothing is ever written to p1
+		defer func() { _ = p1.Close() }() // closed only after copy returns
 		dst := &mockConn{}
 		n, err := copyWithDeadlines(dst, srcR, 30*time.Millisecond, 5*time.Second)
 		if n != 0 || !isTimeoutErr(err) {
@@ -644,7 +644,7 @@ func TestCopyWithDeadlines(t *testing.T) {
 	// L2: a write failure is attributed to the client via *clientWriteErr.
 	t.Run("write failure attributed to client", func(t *testing.T) {
 		srcR, srcW := net.Pipe()
-		defer srcW.Close()
+		defer func() { _ = srcW.Close() }()
 		go func() { _, _ = srcW.Write([]byte("data")) }()
 		dst := &mockConn{onWrite: func(b []byte) (int, error) {
 			return 0, timeoutError{msg: "i/o timeout"}
@@ -731,7 +731,7 @@ func TestMirrorWriteChunkSuccess(t *testing.T) {
 // the conn so a blocked writeAll returns immediately.
 func TestMirrorInterruptUnblocksWrite(t *testing.T) {
 	server, client := net.Pipe() // synchronous: Write with no reader blocks
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 	mw := &mirrorWriter{addr: "test:0", writeTimeout: 10 * time.Second, conn: client}
 	mw.connPtr.Store(&client)
 
@@ -758,7 +758,7 @@ func TestMirrorStopInterruptsStuckWrite(t *testing.T) {
 	done := make(chan struct{})
 	t.Cleanup(func() { close(done) })
 	ln := startLoopback(t, func(c net.Conn) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		<-done // accept but never read -> sender's writes eventually block
 	})
 
@@ -947,7 +947,7 @@ func TestAcceptLoopMaxConns(t *testing.T) {
 // listener close the loop exits and all sessions drain (no leaked Adds).
 func TestAcceptLoopShutdownSmoke(t *testing.T) {
 	primaryLn := startLoopback(t, func(c net.Conn) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		_, _ = io.Copy(c, c) // echo
 	})
 
@@ -983,7 +983,7 @@ func TestAcceptLoopShutdownSmoke(t *testing.T) {
 	for _, c := range clients {
 		_ = c.Close()
 	}
-	l.Close() // unblocks Accept -> ErrClosed -> loop returns
+	_ = l.Close() // unblocks Accept -> ErrClosed -> loop returns
 	<-accepting
 
 	if !waitGroupDone(&activeSessions, 3*time.Second) {
@@ -1043,7 +1043,7 @@ func TestFanOutSlowMirrorDoesNotBlockPrimary(t *testing.T) {
 	hold := make(chan struct{})
 	t.Cleanup(func() { close(hold) })
 	mirrorLn := startLoopback(t, func(c net.Conn) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		<-hold // never read -> mirror buffers fill, sends get dropped
 	})
 

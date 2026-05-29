@@ -176,12 +176,12 @@ func closeAllConns() {
 	for i, t := range conns {
 		// Set deadline to now to unblock any pending I/O, then close
 		if t.client != nil {
-			t.client.SetDeadline(time.Now())
-			t.client.Close()
+			_ = t.client.SetDeadline(time.Now())
+			_ = t.client.Close()
 		}
 		if t.primary != nil {
-			t.primary.SetDeadline(time.Now())
-			t.primary.Close()
+			_ = t.primary.SetDeadline(time.Now())
+			_ = t.primary.Close()
 		}
 		slog.Debug("force-closed connection", "sid", sids[i])
 	}
@@ -272,7 +272,7 @@ func writeAll(conn net.Conn, data []byte, timeout time.Duration) error {
 		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 			return err
 		}
-		defer conn.SetWriteDeadline(time.Time{}) // clear deadline (error ignored - conn will be closed on failure)
+		defer func() { _ = conn.SetWriteDeadline(time.Time{}) }() // clear deadline (error ignored - conn will be closed on failure)
 	}
 	for len(data) > 0 {
 		n, err := conn.Write(data)
@@ -580,7 +580,7 @@ func newMirrorWriter(addr string, wg *sync.WaitGroup, connTimeout, writeTimeout 
 // Only called from run() goroutine which owns the connection.
 func (mw *mirrorWriter) closeConn() {
 	if mw.conn != nil {
-		mw.conn.Close()
+		_ = mw.conn.Close()
 		mw.conn = nil
 		mw.connPtr.Store(nil)
 	}
@@ -593,7 +593,7 @@ func (mw *mirrorWriter) closeConn() {
 // interrupt lost, whereas a closed conn fails the in-flight and all later writes.
 func (mw *mirrorWriter) interrupt() {
 	if p := mw.connPtr.Load(); p != nil {
-		(*p).Close()
+		_ = (*p).Close()
 	}
 }
 
@@ -772,7 +772,7 @@ func acceptLoop(accept func() (net.Conn, error), handle func(net.Conn), sleep fu
 			case sem <- struct{}{}:
 			default:
 				slog.Warn("connection rejected: max connections reached", "max", maxConns, "client", conn.RemoteAddr())
-				conn.Close()
+				_ = conn.Close()
 				continue
 			}
 		}
@@ -901,7 +901,7 @@ func main() {
 	slog.Info("shutdown initiated", "signal", sig.String(), "active_sessions", activeCount.Load())
 
 	// Stop accepting new connections
-	l.Close()
+	_ = l.Close()
 	<-accepting // wait for accept loop to exit
 
 	// Wait for active sessions with timeout
@@ -944,9 +944,9 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lin
 
 	// Ensure session summary is always logged
 	defer func() {
-		in.Close()
+		_ = in.Close()
 		if primary != nil {
-			primary.Close()
+			_ = primary.Close()
 		}
 		attrs := []any{
 			"sid", sid,
@@ -1004,10 +1004,10 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lin
 		// Half-close primary: signal EOF to server while keeping read side open
 		// This allows server to finish sending any response data
 		if tc, ok := primary.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		} else {
 			// Fallback for non-TCP connections: close entirely
-			primary.Close()
+			_ = primary.Close()
 		}
 	}()
 
@@ -1055,10 +1055,10 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lin
 		// idle timeout is disabled. This is best-effort: if the client is still
 		// actively sending (primary only half-closed its write side), fanOut may
 		// re-arm its own read deadline and keep relaying until client EOF/idle.
-		in.SetReadDeadline(time.Now())
+		_ = in.SetReadDeadline(time.Now())
 		// Half-close the client write side: signal no more responses are coming.
 		if tc, ok := in.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		}
 	}()
 

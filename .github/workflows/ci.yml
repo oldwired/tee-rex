@@ -74,18 +74,26 @@ jobs:
           fi
 
       - name: golangci-lint
-        # golangci-lint-action v7+ is required for golangci-lint v2.x;
-        # v6 only supports v1.x and rejects "v2.*" version strings.
-        uses: golangci/golangci-lint-action@v7
+        # golangci-lint-action v8+ is required for golangci-lint v2.x
+        # (v6 only supports v1.x); v9 is the first release on the Node 24
+        # runtime, so it avoids the Node 20 deprecation warning.
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
 
   vuln:
     runs-on: ubuntu-latest
     steps:
-      # govulncheck-action handles checkout + Go install internally.
-      - name: govulncheck
-        uses: golang/govulncheck-action@v1
+      # Install govulncheck directly rather than using govulncheck-action,
+      # which still bundles Node 20 sub-actions and tries to cache on a
+      # go.sum that a stdlib-only module doesn't have. cache: false keeps
+      # setup-go from emitting that same "go.sum not found" warning.
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          go-package: ./...
+          cache: false
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
