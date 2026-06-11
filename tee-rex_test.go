@@ -362,7 +362,7 @@ func TestFanOutLinesBytesIn(t *testing.T) {
 		_ = srcW.Close()
 	}()
 
-	fanOutLines(srcR, primary, nil, []byte("\r\n"), 0, defaultMaxLineLen, 5*time.Second, 0, "drop", 1, stats)
+	fanOutLines(srcR, primary, nil, []byte("\r\n"), 0, defaultMaxLineLen, 5*time.Second, "drop", 1, stats)
 
 	if got := stats.framesIn.Load(); got != 2 {
 		t.Fatalf("framesIn=%d want 2", got)
@@ -621,7 +621,7 @@ func TestCopyWithDeadlines(t *testing.T) {
 			_, _ = srcW.Write([]byte("hello"))
 			_ = srcW.Close()
 		}()
-		n, err := copyWithDeadlines(dst, srcR, 0, 5*time.Second)
+		n, err := copyWithDeadlines(dst, srcR, 5*time.Second)
 		if err != nil || n != 5 || string(dst.bytesWritten()) != "hello" {
 			t.Fatalf("n=%d err=%v written=%q", n, err, dst.bytesWritten())
 		}
@@ -631,7 +631,10 @@ func TestCopyWithDeadlines(t *testing.T) {
 		p1, srcR := net.Pipe()            // nothing is ever written to p1
 		defer func() { _ = p1.Close() }() // closed only after copy returns
 		dst := &mockConn{}
-		n, err := copyWithDeadlines(dst, srcR, 30*time.Millisecond, 5*time.Second)
+		// Idle detection lives in idleConn now; the monitor sees no activity in
+		// either direction, so the read times out as a genuine session idle.
+		src := newIdleConn(srcR, 30*time.Millisecond, newActivityMonitor(), 1, "primary")
+		n, err := copyWithDeadlines(dst, src, 5*time.Second)
 		if n != 0 || !isTimeoutErr(err) {
 			t.Fatalf("n=%d err=%v want read timeout", n, err)
 		}
@@ -649,7 +652,7 @@ func TestCopyWithDeadlines(t *testing.T) {
 		dst := &mockConn{onWrite: func(b []byte) (int, error) {
 			return 0, timeoutError{msg: "i/o timeout"}
 		}}
-		_, err := copyWithDeadlines(dst, srcR, 0, 50*time.Millisecond)
+		_, err := copyWithDeadlines(dst, srcR, 50*time.Millisecond)
 		var cwErr *clientWriteErr
 		if !errors.As(err, &cwErr) {
 			t.Fatalf("err=%v want *clientWriteErr", err)
@@ -669,7 +672,7 @@ func TestCopyWithDeadlines(t *testing.T) {
 		}()
 		dst := &mockConn{}
 		before := time.Now()
-		if _, err := copyWithDeadlines(dst, srcR, 0, 200*time.Millisecond); err != nil {
+		if _, err := copyWithDeadlines(dst, srcR, 200*time.Millisecond); err != nil {
 			t.Fatalf("err=%v", err)
 		}
 		d, ok := dst.firstNonZeroWriteDeadline()
@@ -798,7 +801,7 @@ func TestHandleConnPrimaryGoneClientSilent(t *testing.T) {
 			defer close(done)
 			// idleTimeout = 0 -> without M4 this never returns.
 			handleConnection(in, primaryLn.Addr().String(), nil, false, nil, 0,
-				defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 0)
+				defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 0, time.Second)
 		}()
 		select {
 		case <-done:
@@ -958,7 +961,7 @@ func TestAcceptLoopShutdownSmoke(t *testing.T) {
 
 	handle := func(c net.Conn) {
 		handleConnection(c, primaryLn.Addr().String(), nil, false, nil, 0,
-			defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 2*time.Second)
+			defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 2*time.Second, time.Second)
 	}
 	accepting := make(chan struct{})
 	go func() { defer close(accepting); acceptLoop(l.Accept, handle, time.Sleep, 0) }()
@@ -1004,7 +1007,7 @@ func TestFanOutRelaysToPrimary(t *testing.T) {
 		_ = srcW.Close()
 	}()
 
-	fanOut(srcR, primary, nil, 5*time.Second, 0, 1, stats)
+	fanOut(srcR, primary, nil, 5*time.Second, 1, stats)
 
 	if got := string(primary.bytesWritten()); got != "hello" {
 		t.Fatalf("primary got %q want hello", got)
@@ -1028,7 +1031,7 @@ func TestFanOutPrimaryWriteErrorStops(t *testing.T) {
 		_ = srcW.Close()
 	}()
 
-	fanOut(srcR, primary, nil, 5*time.Second, 0, 1, stats)
+	fanOut(srcR, primary, nil, 5*time.Second, 1, stats)
 
 	if stats.getEndReason() != reasonPrimaryWriteErr {
 		t.Fatalf("reason=%s want primary_write_error", stats.getEndReason())
@@ -1067,7 +1070,7 @@ func TestFanOutSlowMirrorDoesNotBlockPrimary(t *testing.T) {
 	}()
 
 	start := time.Now()
-	fanOut(srcR, primary, mirrors, 5*time.Second, 0, 1, stats)
+	fanOut(srcR, primary, mirrors, 5*time.Second, 1, stats)
 	elapsed := time.Since(start)
 
 	for _, m := range mirrors {
@@ -1112,7 +1115,7 @@ func TestFanOutLinesPartialPolicies(t *testing.T) {
 				_ = srcW.Close()
 			}()
 
-			fanOutLines(srcR, primary, nil, []byte("\r\n"), 0, defaultMaxLineLen, 5*time.Second, 0, tc.policy, 1, stats)
+			fanOutLines(srcR, primary, nil, []byte("\r\n"), 0, defaultMaxLineLen, 5*time.Second, tc.policy, 1, stats)
 
 			if got := string(primary.bytesWritten()); got != tc.wantPrimary {
 				t.Fatalf("primary=%q want %q", got, tc.wantPrimary)
@@ -1136,12 +1139,349 @@ func TestFanOutLinesFrameTooLarge(t *testing.T) {
 		_ = srcW.Close()
 	}()
 
-	fanOutLines(srcR, primary, nil, []byte("\r\n"), 0, 10, 5*time.Second, 0, "drop", 1, stats)
+	fanOutLines(srcR, primary, nil, []byte("\r\n"), 0, 10, 5*time.Second, "drop", 1, stats)
 
 	if stats.getEndReason() != reasonFrameTooLarge {
 		t.Fatalf("reason=%s want frame_too_large", stats.getEndReason())
 	}
 	if len(primary.bytesWritten()) != 0 {
 		t.Fatalf("oversized frame must not be forwarded, primary got %q", primary.bytesWritten())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// C-suite: session-wide idle detection (idleConn) and mirror draining.
+// ---------------------------------------------------------------------------
+
+// TestIdleConnSessionWideIdle covers the asymmetric-traffic case (e.g.
+// FrontelGI: client heartbeats, server stays silent): activity on the *other*
+// direction must keep a silent read alive; the timeout may only surface once
+// the whole session has been idle for idleTimeout.
+func TestIdleConnSessionWideIdle(t *testing.T) {
+	p1, p2 := net.Pipe()
+	defer func() { _ = p1.Close() }()
+	defer func() { _ = p2.Close() }()
+
+	activity := newActivityMonitor()
+	ic := newIdleConn(p2, 60*time.Millisecond, activity, 1, "primary")
+
+	// Simulate other-direction traffic: touch the shared monitor every 20ms
+	// for ~300ms, then go silent. p1 never writes, so this read side sees
+	// nothing but deadline wakeups the whole time.
+	activeUntil := time.Now().Add(300 * time.Millisecond)
+	stopTouch := make(chan struct{})
+	go func() {
+		defer close(stopTouch)
+		for time.Now().Before(activeUntil) {
+			activity.touch()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	buf := make([]byte, 16)
+	n, err := ic.Read(buf)
+	if n != 0 || !isTimeoutErr(err) {
+		t.Fatalf("n=%d err=%v, want a timeout with no data", n, err)
+	}
+	if time.Now().Before(activeUntil) {
+		t.Fatal("read timed out while the session was still active (per-direction idle regression)")
+	}
+	<-stopTouch
+}
+
+// TestIdleConnGenuineIdle: with no activity anywhere the read times out after
+// roughly idleTimeout.
+func TestIdleConnGenuineIdle(t *testing.T) {
+	p1, p2 := net.Pipe()
+	defer func() { _ = p1.Close() }()
+	defer func() { _ = p2.Close() }()
+
+	ic := newIdleConn(p2, 50*time.Millisecond, newActivityMonitor(), 1, "client")
+	start := time.Now()
+	_, err := ic.Read(make([]byte, 8))
+	if !isTimeoutErr(err) {
+		t.Fatalf("err=%v want timeout", err)
+	}
+	if d := time.Since(start); d < 40*time.Millisecond || d > 2*time.Second {
+		t.Fatalf("idle fired after %v, want ~50ms", d)
+	}
+}
+
+// TestIdleConnUnblock: unblock() forces a blocked read to surface promptly as
+// errReadUnblocked, which classifies as a self-inflicted close (silent
+// teardown), and is not retried even though the session looks active.
+func TestIdleConnUnblock(t *testing.T) {
+	p1, p2 := net.Pipe()
+	defer func() { _ = p1.Close() }()
+	defer func() { _ = p2.Close() }()
+
+	activity := newActivityMonitor()
+	ic := newIdleConn(p2, time.Hour, activity, 1, "client")
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ic.Read(make([]byte, 8))
+		errCh <- err
+	}()
+
+	time.Sleep(20 * time.Millisecond) // let the read block
+	activity.touch()                  // session looks active: a plain timeout would be retried
+	ic.unblock()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, errReadUnblocked) {
+			t.Fatalf("err=%v want errReadUnblocked", err)
+		}
+		if !isClosedErr(err) {
+			t.Fatal("errReadUnblocked must classify as a self-inflicted close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("unblock did not unblock the read")
+	}
+}
+
+// TestHandleConnSilentPrimaryActiveClient is the FrontelGI regression: a
+// primary that never speaks (no ACKs, like an AS) must not get the session
+// killed while the client is actively sending heartbeats. Also verifies the
+// debug receive logging on the client side.
+func TestHandleConnSilentPrimaryActiveClient(t *testing.T) {
+	primaryLn := startLoopback(t, func(c net.Conn) {
+		_, _ = io.Copy(io.Discard, c) // consume but never respond
+		_ = c.Close()
+	})
+	client, in := tcpConnPair(t)
+
+	done := make(chan struct{})
+	logs := captureLogs(t, func() {
+		go func() {
+			defer close(done)
+			handleConnection(in, primaryLn.Addr().String(), nil, false, nil, 0,
+				defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 80*time.Millisecond, time.Second)
+		}()
+		// Heartbeat every 20ms for ~400ms — five times the idle timeout. The
+		// primary direction is silent throughout.
+		for i := 0; i < 20; i++ {
+			if _, err := client.Write([]byte("TEST\x03")); err != nil {
+				t.Fatalf("heartbeat %d failed: %v (session killed while client active?)", i, err)
+			}
+			time.Sleep(20 * time.Millisecond)
+			select {
+			case <-done:
+				t.Fatal("session ended while the client was active (per-direction idle regression)")
+			default:
+			}
+		}
+		_ = client.Close()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("session did not end after client close")
+		}
+	})
+
+	if strings.Contains(logs, "reason="+reasonSessionIdle) {
+		t.Errorf("session must not end as idle while one direction is active:\n%s", logs)
+	}
+	if !strings.Contains(logs, "reason="+reasonClientEOF) {
+		t.Errorf("want reason=client_eof:\n%s", logs)
+	}
+	if !strings.Contains(logs, `msg="data received"`) || !strings.Contains(logs, "from=client") {
+		t.Errorf("expected debug receive logging for client data:\n%s", logs)
+	}
+}
+
+// TestHandleConnSessionIdleBothDirections: when *neither* direction has
+// traffic, the session ends as session_idle after idleTimeout.
+func TestHandleConnSessionIdleBothDirections(t *testing.T) {
+	primaryLn := startLoopback(t, func(c net.Conn) {
+		_, _ = io.Copy(io.Discard, c)
+		_ = c.Close()
+	})
+	client, in := tcpConnPair(t)
+	_ = client // stays silent
+
+	logs := captureLogs(t, func() {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			handleConnection(in, primaryLn.Addr().String(), nil, false, nil, 0,
+				defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 60*time.Millisecond, time.Second)
+		}()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("session did not end on a fully idle session")
+		}
+	})
+
+	if !strings.Contains(logs, "reason="+reasonSessionIdle) {
+		t.Errorf("want reason=session_idle:\n%s", logs)
+	}
+}
+
+// TestMirrorDrainFlushesQueued covers the session-teardown drain: frames still
+// queued when the session ends must reach the mirror instead of being
+// discarded (the truncation bug observed at the customer site).
+func TestMirrorDrainFlushesQueued(t *testing.T) {
+	var mu sync.Mutex
+	var got []byte
+	connClosed := make(chan struct{})
+	mirrorLn := startLoopback(t, func(c net.Conn) {
+		defer close(connClosed)
+		defer func() { _ = c.Close() }()
+		buf := make([]byte, 4096)
+		for {
+			n, err := c.Read(buf)
+			mu.Lock()
+			got = append(got, buf[:n]...)
+			mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	})
+
+	stats := &sessionStats{}
+	var wg sync.WaitGroup
+	mw := newMirrorWriter(mirrorLn.Addr().String(), &wg, time.Second, 5*time.Second, 16, 1, stats)
+
+	want := ""
+	for i := 0; i < 5; i++ {
+		frame := fmt.Sprintf("frame-%d\x03", i)
+		want += frame
+		mw.send([]byte(frame))
+	}
+	mw.beginDrain() // session is over; queued frames must still flush
+
+	if !waitGroupDone(&wg, 3*time.Second) {
+		t.Fatal("mirror writer did not exit after drain")
+	}
+	select {
+	case <-connClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror connection was not closed after drain")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if string(got) != want {
+		t.Fatalf("mirror got %q want %q", got, want)
+	}
+	if d := stats.mirrorDrops.Load(); d != 0 {
+		t.Fatalf("mirrorDrops=%d want 0 (everything flushed)", d)
+	}
+}
+
+// TestMirrorForceStopCountsDrops: chunks abandoned by a force-stop are counted
+// in mirror_drops instead of vanishing silently.
+func TestMirrorForceStopCountsDrops(t *testing.T) {
+	stats := &sessionStats{}
+	mw := &mirrorWriter{
+		addr:         "127.0.0.1:1", // never dialed: run() observes done first
+		ch:           make(chan []byte, 8),
+		done:         make(chan struct{}),
+		connTimeout:  time.Second,
+		writeTimeout: 5 * time.Second,
+		sid:          1,
+		stats:        stats,
+	}
+	mw.send([]byte("a"))
+	mw.send([]byte("b"))
+	mw.send([]byte("c"))
+	mw.stop() // force-stop before run() ever gets to write
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go mw.run(&wg)
+	if !waitGroupDone(&wg, 2*time.Second) {
+		t.Fatal("run did not exit after stop")
+	}
+	if got := stats.mirrorDrops.Load(); got != 3 {
+		t.Fatalf("mirrorDrops=%d want 3 (abandoned chunks must be counted)", got)
+	}
+}
+
+// TestHandleConnMirrorGetsBurstBeforeClose is the end-to-end customer
+// scenario: a client bursts several frames and disconnects immediately; the
+// mirror must still receive every frame (pre-drain it often received none).
+func TestHandleConnMirrorGetsBurstBeforeClose(t *testing.T) {
+	var mu sync.Mutex
+	var got []byte
+	connClosed := make(chan struct{})
+	mirrorLn := startLoopback(t, func(c net.Conn) {
+		defer close(connClosed)
+		defer func() { _ = c.Close() }()
+		buf := make([]byte, 4096)
+		for {
+			n, err := c.Read(buf)
+			mu.Lock()
+			got = append(got, buf[:n]...)
+			mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	})
+	primaryLn := startLoopback(t, func(c net.Conn) {
+		_, _ = io.Copy(io.Discard, c)
+		_ = c.Close()
+	})
+
+	client, in := tcpConnPair(t)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleConnection(in, primaryLn.Addr().String(), []string{mirrorLn.Addr().String()},
+			true, []byte{0x03}, 0, defaultMaxLineLen, "drop",
+			time.Second, 5*time.Second, 16, 0, 2*time.Second)
+	}()
+
+	burst := ""
+	for i := 1; i <= 5; i++ {
+		burst += fmt.Sprintf("EVENT %d\x03", i)
+	}
+	if _, err := client.Write([]byte(burst)); err != nil {
+		t.Fatalf("burst write: %v", err)
+	}
+	_ = client.Close() // disconnect immediately, like a short-lived session
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleConnection did not return")
+	}
+	select {
+	case <-connClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror connection was not closed")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if string(got) != burst {
+		t.Fatalf("mirror got %q want the full burst %q", got, burst)
+	}
+}
+
+// TestBuildLogHandler covers the -logfile/-logformat plumbing: the handler
+// writes to the given writer, honors the level, and emits the chosen format.
+func TestBuildLogHandler(t *testing.T) {
+	var buf bytes.Buffer
+	slog.New(buildLogHandler(&buf, "debug", "json")).Debug("hello", "k", "v")
+	if !strings.Contains(buf.String(), `"msg":"hello"`) {
+		t.Fatalf("json output missing msg: %q", buf.String())
+	}
+
+	buf.Reset()
+	slog.New(buildLogHandler(&buf, "info", "text")).Debug("hidden")
+	if buf.Len() != 0 {
+		t.Fatalf("debug must be suppressed at info level: %q", buf.String())
+	}
+
+	buf.Reset()
+	slog.New(buildLogHandler(&buf, "error", "text")).Info("hidden")
+	if buf.Len() != 0 {
+		t.Fatalf("info must be suppressed at error level: %q", buf.String())
 	}
 }

@@ -86,7 +86,6 @@ const (
 const (
 	reasonClientEOF       = "client_eof"
 	reasonClientReset     = "client_reset"
-	reasonClientIdle      = "client_idle"
 	reasonClientReadErr   = "client_read_error"
 	reasonClientSlow      = "client_slow"        // client too slow to drain (write timeout)
 	reasonClientWriteErr  = "client_write_error" // non-timeout failure writing to client
@@ -94,8 +93,8 @@ const (
 	reasonPrimaryWriteErr = "primary_write_error"
 	reasonPrimaryReadErr  = "primary_read_error"
 	reasonPrimaryReset    = "primary_reset"
-	reasonPrimaryIdle     = "primary_idle"
-	reasonPrimaryEOF      = "primary_eof" // primary closed its side (no error)
+	reasonPrimaryEOF      = "primary_eof"  // primary closed its side (no error)
+	reasonSessionIdle     = "session_idle" // no data in either direction for -idletimeout
 	reasonFrameTooLarge   = "frame_too_large"
 	reasonPartialFrame    = "partial_frame"
 )
@@ -199,6 +198,7 @@ type mirrorWriter struct {
 	connPtr      atomic.Pointer[net.Conn] // atomic view of conn for interrupt()
 	ch           chan []byte
 	done         chan struct{}
+	drainOnce    sync.Once
 	stopOnce     sync.Once
 	connTimeout  time.Duration
 	writeTimeout time.Duration
@@ -225,6 +225,9 @@ var (
 	logFormatPtr = flag.String("logformat", "text",
 		"Log format: text (key=value) or json")
 
+	logFilePtr = flag.String("logfile", "",
+		"Append logs to `file` instead of stderr")
+
 	lineModePtr = flag.Bool("line", false, "Enable line-oriented mode for text protocols (SMTP, FTP, IRC, etc.)")
 
 	delimPtr = flag.String("delim", "crlf",
@@ -247,6 +250,9 @@ var (
 
 	mirrorBufPtr = flag.Int("mirrorbuf", 100,
 		"Buffer size for mirror write channels (per mirror)")
+
+	mirrorDrainPtr = flag.Duration("mirrordrain", 5*time.Second,
+		"How long to wait at session end for queued mirror data to flush (0 = drop immediately)")
 
 	idleTimeoutPtr = flag.Duration("idletimeout", 2*time.Minute,
 		"Idle timeout for client and primary connections (0 to disable)")
@@ -297,24 +303,126 @@ type clientWriteErr struct{ err error }
 func (e *clientWriteErr) Error() string { return e.err.Error() }
 func (e *clientWriteErr) Unwrap() error { return e.err }
 
-// copyWithDeadlines copies from src to dst until EOF or error.
-// idleTimeout bounds each blocking read on src (idle detection); writeTimeout
-// bounds each write to dst (independent of idleTimeout, so the write side has a
-// deadline even when idle detection is disabled). A write failure is wrapped in
-// *clientWriteErr so the caller can tell it apart from a src read failure.
-// Returns bytes copied and any error (io.EOF normalized to nil).
-func copyWithDeadlines(dst net.Conn, src net.Conn, idleTimeout, writeTimeout time.Duration) (int64, error) {
+// activityMonitor tracks when a session last saw data in either direction so
+// idle detection is session-wide: traffic client→primary keeps the
+// primary→client read alive and vice versa. Asymmetric protocols (e.g. a
+// client that heartbeats into a server that never responds, like FrontelGI)
+// would otherwise be torn down by the silent direction's own timer.
+type activityMonitor struct {
+	last atomic.Int64 // unix nanos of the last byte seen in either direction
+}
+
+func newActivityMonitor() *activityMonitor {
+	m := &activityMonitor{}
+	m.touch()
+	return m
+}
+
+func (m *activityMonitor) touch() { m.last.Store(time.Now().UnixNano()) }
+
+// idleDeadline returns the instant the session becomes idle: timeout after the
+// last activity in either direction.
+func (m *activityMonitor) idleDeadline(timeout time.Duration) time.Time {
+	return time.Unix(0, m.last.Load()).Add(timeout)
+}
+
+// errReadUnblocked marks a read that was deliberately unblocked for session
+// teardown (idleConn.unblock); isClosedErr treats it as a self-inflicted close.
+var errReadUnblocked = errors.New("read unblocked for session teardown")
+
+// idleConn wraps one side of a session and owns that side's read deadlines.
+//
+//   - Idle detection: before each read the deadline is armed to the shared
+//     activity monitor's idle instant. A deadline that fires while the *other*
+//     direction was recently active is stale — it is re-armed and the read
+//     retried, so only a genuinely session-wide idle surfaces as a timeout.
+//   - Receive logging: every chunk read is logged at debug level.
+//   - unblock(): teardown helper that makes a blocked read return
+//     errReadUnblocked instead of being retried (used when the opposite
+//     direction has ended and further data has nowhere to go).
+//
+// With idleTimeout 0 no deadlines are armed, and a timeout (necessarily from an
+// external SetReadDeadline: unblock() or shutdown's force-close) is never
+// retried.
+type idleConn struct {
+	net.Conn
+	idleTimeout time.Duration
+	activity    *activityMonitor
+	sid         uint64
+	label       string // "client" or "primary", for logs
+
+	mu        sync.Mutex // guards unblocked and serializes deadline arming against unblock()
+	unblocked bool
+}
+
+func newIdleConn(conn net.Conn, idleTimeout time.Duration, activity *activityMonitor, sid uint64, label string) *idleConn {
+	return &idleConn{Conn: conn, idleTimeout: idleTimeout, activity: activity, sid: sid, label: label}
+}
+
+// arm sets the read deadline to the session-wide idle instant. Skipped when
+// unblocked so the "now" deadline set by unblock() is never overwritten.
+func (c *idleConn) arm() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.unblocked && c.idleTimeout > 0 {
+		_ = c.Conn.SetReadDeadline(c.activity.idleDeadline(c.idleTimeout))
+	}
+}
+
+func (c *idleConn) isUnblocked() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.unblocked
+}
+
+// unblock makes any current or future Read return errReadUnblocked promptly.
+// Safe to call from any goroutine.
+func (c *idleConn) unblock() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.unblocked = true
+	_ = c.Conn.SetReadDeadline(time.Now())
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	for {
+		c.arm()
+		n, err := c.Conn.Read(p)
+		if n > 0 {
+			c.activity.touch()
+			slog.Debug("data received", "sid", c.sid, "from", c.label, "bytes", n)
+		}
+		if err == nil || !isTimeoutErr(err) {
+			return n, err
+		}
+		// A read deadline fired: a teardown unblock, a genuine session idle, or
+		// a stale deadline outdated by activity on the other direction.
+		if c.isUnblocked() {
+			if n > 0 {
+				return n, nil
+			}
+			return 0, errReadUnblocked
+		}
+		if c.idleTimeout <= 0 || !time.Now().Before(c.activity.idleDeadline(c.idleTimeout)) {
+			return n, err // genuine idle (or an external deadline with idle disabled)
+		}
+		if n > 0 {
+			return n, nil // deliver data; the retry happens on the caller's next Read
+		}
+	}
+}
+
+// copyWithDeadlines copies from src to dst until EOF or error. Read-side idle
+// detection is owned by src (an *idleConn arms a session-wide deadline; a bare
+// conn blocks until data or close); writeTimeout bounds each write to dst. A
+// write failure is wrapped in *clientWriteErr so the caller can tell it apart
+// from a src read failure. Returns bytes copied and any error (io.EOF
+// normalized to nil).
+func copyWithDeadlines(dst net.Conn, src net.Conn, writeTimeout time.Duration) (int64, error) {
 	buf := make([]byte, copyBufSize)
 	var total int64
 
 	for {
-		// Set read deadline before blocking on Read
-		if idleTimeout > 0 {
-			if err := src.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
-				return total, err
-			}
-		}
-
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			// writeAll handles partial writes and sets/clears write deadline
@@ -441,12 +549,13 @@ func configWarnings(lineMode bool, mirrorbuf, maxframe, nMirrors int) []string {
 // ErrFrameTooLarge is returned when a frame exceeds the maximum allowed size
 var ErrFrameTooLarge = errors.New("frame too large")
 
-// isClosedErr returns true for errors indicating we closed the connection ourselves
+// isClosedErr returns true for errors indicating we closed the connection (or
+// deliberately ended reads on it) ourselves
 func isClosedErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, net.ErrClosed) {
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, errReadUnblocked) {
 		return true
 	}
 	return strings.Contains(err.Error(), "use of closed network connection")
@@ -598,7 +707,10 @@ func (mw *mirrorWriter) interrupt() {
 }
 
 // run is the mirror writer goroutine that handles writes and reconnection.
-// This goroutine is the sole owner of the connection.
+// This goroutine is the sole owner of the connection. It exits when the send
+// channel is closed and fully drained (graceful end via beginDrain) or as soon
+// as done is closed (force-stop via stop) — in the latter case whatever is
+// still queued is counted as mirror drops instead of vanishing silently.
 func (mw *mirrorWriter) run(wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer mw.closeConn()
@@ -608,16 +720,18 @@ func (mw *mirrorWriter) run(wg *sync.WaitGroup) {
 	for {
 		select {
 		case <-mw.done:
+			mw.dropRemaining(0)
 			return
 		case data, ok := <-mw.ch:
 			if !ok {
-				// Channel closed by stop()
+				// Channel closed and drained: graceful end
 				return
 			}
 
-			// Check done before potentially blocking operations
+			// Re-check done so a force-stop isn't outraced by buffered chunks
 			select {
 			case <-mw.done:
+				mw.dropRemaining(1) // current chunk plus whatever is queued
 				return
 			default:
 			}
@@ -625,6 +739,22 @@ func (mw *mirrorWriter) run(wg *sync.WaitGroup) {
 			mw.writeChunk(data, &backoff)
 		}
 	}
+}
+
+// dropRemaining counts n plus all still-queued chunks as mirror drops after a
+// force-stop. Only called once done is closed; stop() closes ch before done,
+// so draining the channel here terminates.
+func (mw *mirrorWriter) dropRemaining(n uint64) {
+	for range mw.ch {
+		n++
+	}
+	if n == 0 {
+		return
+	}
+	if mw.stats != nil {
+		mw.stats.mirrorDrops.Add(n)
+	}
+	slog.Debug("mirror chunks dropped at stop", "sid", mw.sid, "mirror", mw.addr, "dropped", n)
 }
 
 // writeChunk delivers one chunk to the mirror, connecting first if needed.
@@ -651,6 +781,7 @@ func (mw *mirrorWriter) writeChunk(data []byte, backoff *time.Duration) {
 		}
 		return
 	}
+	slog.Debug("mirror write ok", "sid", mw.sid, "mirror", mw.addr, "bytes", len(data))
 	*backoff = initialBackoff // reset on success
 }
 
@@ -718,16 +849,40 @@ func (mw *mirrorWriter) send(data []byte) {
 	}
 }
 
-// stop signals the mirror writer to shut down (idempotent).
-// Closes done and ch to unblock run() from any waiting state, and interrupts
-// any in-flight write by force-closing the connection. run() then exits and its
-// deferred closeConn() cleans up.
+// beginDrain closes the send channel: run() delivers whatever is already
+// queued and then exits. Callers must not send() afterwards. Idempotent.
+func (mw *mirrorWriter) beginDrain() {
+	mw.drainOnce.Do(func() { close(mw.ch) })
+}
+
+// stop force-stops the mirror writer (idempotent): still-queued chunks are
+// counted as drops and an in-flight write is interrupted by force-closing the
+// connection, after which run() exits and its deferred closeConn() cleans up.
 func (mw *mirrorWriter) stop() {
+	mw.beginDrain() // ensure ch is closed so run()'s drop-drain loop terminates
 	mw.stopOnce.Do(func() {
-		close(mw.done)
-		close(mw.ch)   // unblock run() if waiting on channel receive
+		close(mw.done) // unblock run() from any waiting state
 		mw.interrupt() // unblock run() if blocked in an in-flight write
 	})
+}
+
+// buildLogHandler returns the slog handler for the configured level and
+// format, writing to w.
+func buildLogHandler(w io.Writer, level, format string) slog.Handler {
+	var lv slog.Level
+	switch level {
+	case "error":
+		lv = slog.LevelError
+	case "debug":
+		lv = slog.LevelDebug
+	default:
+		lv = slog.LevelInfo
+	}
+	opts := &slog.HandlerOptions{Level: lv}
+	if format == "json" {
+		return slog.NewJSONHandler(w, opts)
+	}
+	return slog.NewTextHandler(w, opts)
 }
 
 // acceptLoop accepts connections and dispatches each to handle in its own
@@ -799,24 +954,18 @@ func main() {
 		return
 	}
 
-	// Set up slog logger
-	var level slog.Level
-	switch *logLevelPtr {
-	case "error":
-		level = slog.LevelError
-	case "debug":
-		level = slog.LevelDebug
-	default:
-		level = slog.LevelInfo
+	// Set up slog logger, optionally appending to a file instead of stderr
+	logDst := io.Writer(os.Stderr)
+	if *logFilePtr != "" {
+		f, err := os.OpenFile(*logFilePtr, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening log file: %v\n", err)
+			os.Exit(1)
+		}
+		defer func() { _ = f.Close() }()
+		logDst = f
 	}
-	opts := &slog.HandlerOptions{Level: level}
-	var handler slog.Handler
-	if *logFormatPtr == "json" {
-		handler = slog.NewJSONHandler(os.Stderr, opts)
-	} else {
-		handler = slog.NewTextHandler(os.Stderr, opts)
-	}
-	slog.SetDefault(slog.New(handler))
+	slog.SetDefault(slog.New(buildLogHandler(logDst, *logLevelPtr, *logFormatPtr)))
 
 	var mirrorAddrs []string
 	if *mirrorPtr != "" {
@@ -851,6 +1000,13 @@ func main() {
 	writeTimeout := *writeTimeoutPtr
 	if writeTimeout < minWriteTimeout {
 		writeTimeout = minWriteTimeout
+	}
+
+	// A negative drain makes no sense; clamp to 0 (drop queued mirror data
+	// immediately at session end)
+	mirrorDrain := *mirrorDrainPtr
+	if mirrorDrain < 0 {
+		mirrorDrain = 0
 	}
 
 	fmt.Printf("tee-rex %s\n", versionString())
@@ -888,7 +1044,7 @@ func main() {
 
 	// Accept loop in goroutine so we can select on shutdown.
 	handle := func(c net.Conn) {
-		handleConnection(c, *primaryPtr, mirrorAddrs, *lineModePtr, delim, esc, *maxFramePtr, *partialPtr, *connTimeoutPtr, writeTimeout, *mirrorBufPtr, *idleTimeoutPtr)
+		handleConnection(c, *primaryPtr, mirrorAddrs, *lineModePtr, delim, esc, *maxFramePtr, *partialPtr, *connTimeoutPtr, writeTimeout, *mirrorBufPtr, *idleTimeoutPtr, mirrorDrain)
 	}
 	accepting := make(chan struct{})
 	go func() {
@@ -930,7 +1086,7 @@ func main() {
 
 // handleConnection serves one client session. Session accounting
 // (activeSessions.Add/Done) is owned by acceptLoop, which brackets this call.
-func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lineMode bool, delim []byte, esc byte, maxFrameSize int, partialPolicy string, connTimeout, writeTimeout time.Duration, mirrorBufSize int, idleTimeout time.Duration) {
+func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lineMode bool, delim []byte, esc byte, maxFrameSize int, partialPolicy string, connTimeout, writeTimeout time.Duration, mirrorBufSize int, idleTimeout, mirrorDrain time.Duration) {
 	sid := sessionCounter.Add(1)
 	registerConn(sid, in)
 	defer unregisterConn(sid)
@@ -986,6 +1142,14 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lin
 		mirrors = append(mirrors, mw)
 	}
 
+	// Session-wide idle detection: both directions share one activity monitor,
+	// so traffic either way keeps the whole session alive. Asymmetric protocols
+	// (e.g. a heartbeating client with a silent server) would otherwise be torn
+	// down by the silent direction's own timer.
+	activity := newActivityMonitor()
+	client := newIdleConn(in, idleTimeout, activity, sid, "client")
+	primarySrc := newIdleConn(primary, idleTimeout, activity, sid, "primary")
+
 	var wg sync.WaitGroup
 
 	// Copy incoming data to primary and mirrors
@@ -993,13 +1157,14 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lin
 	go func() {
 		defer wg.Done()
 		if lineMode {
-			fanOutLines(in, primary, mirrors, delim, esc, maxFrameSize, writeTimeout, idleTimeout, partialPolicy, sid, stats)
+			fanOutLines(client, primary, mirrors, delim, esc, maxFrameSize, writeTimeout, partialPolicy, sid, stats)
 		} else {
-			fanOut(in, primary, mirrors, writeTimeout, idleTimeout, sid, stats)
+			fanOut(client, primary, mirrors, writeTimeout, sid, stats)
 		}
-		// Stop all mirror writers
+		// Mirrors: no more data is coming; let queued frames flush (bounded
+		// below by mirrorDrain)
 		for _, mw := range mirrors {
-			mw.stop()
+			mw.beginDrain()
 		}
 		// Half-close primary: signal EOF to server while keeping read side open
 		// This allows server to finish sending any response data
@@ -1015,7 +1180,7 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lin
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		n, err := copyWithDeadlines(in, primary, idleTimeout, writeTimeout)
+		n, err := copyWithDeadlines(in, primarySrc, writeTimeout)
 		stats.bytesOut.Add(uint64(n))
 		var cwErr *clientWriteErr
 		switch {
@@ -1043,19 +1208,17 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lin
 			stats.setEndReason(reasonPrimaryReset)
 			slog.Info("primary connection reset", "sid", sid, "err", err)
 		case isTimeoutErr(err):
-			stats.setEndReason(reasonPrimaryIdle)
-			slog.Info("primary idle timeout", "sid", sid, "err", err)
+			stats.setEndReason(reasonSessionIdle)
+			slog.Info("session idle timeout", "sid", sid, "err", err)
 		default:
 			stats.setEndReason(reasonPrimaryReadErr)
 			slog.Error("primary read failed", "sid", sid, "op", "read", "err", err)
 		}
 		// Primary is done sending. Unblock fanOut's client read (any further
 		// client data has nowhere to go now) so the session tears down promptly
-		// instead of lingering until the client idle timeout — or forever when
-		// idle timeout is disabled. This is best-effort: if the client is still
-		// actively sending (primary only half-closed its write side), fanOut may
-		// re-arm its own read deadline and keep relaying until client EOF/idle.
-		_ = in.SetReadDeadline(time.Now())
+		// instead of lingering until the session idle timeout — or forever when
+		// idle timeout is disabled.
+		client.unblock()
 		// Half-close the client write side: signal no more responses are coming.
 		if tc, ok := in.(interface{ CloseWrite() error }); ok {
 			_ = tc.CloseWrite()
@@ -1063,24 +1226,36 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string, lin
 	}()
 
 	wg.Wait()
-	// Wait for mirror goroutines to finish
-	mirrorWg.Wait()
+	// Wait for mirror goroutines to flush queued data, bounded by mirrorDrain;
+	// then force-stop. The wait after a force-stop is short: stop() interrupts
+	// an in-flight write, and a dial attempt is bounded by connTimeout.
+	if len(mirrors) > 0 {
+		drained := make(chan struct{})
+		go func() {
+			mirrorWg.Wait()
+			close(drained)
+		}()
+		timer := time.NewTimer(mirrorDrain)
+		select {
+		case <-drained:
+			timer.Stop()
+		case <-timer.C:
+			slog.Debug("mirror drain timed out, force-stopping", "sid", sid, "drain", mirrorDrain)
+			for _, mw := range mirrors {
+				mw.stop()
+			}
+			<-drained
+		}
+	}
 }
 
 // fanOut reads from src and writes to primary (required) and mirrors (best-effort async).
 // Primary write errors stop the operation. Mirror writes are non-blocking via channels.
-// idleTimeout sets read deadline on src to detect idle clients.
-func fanOut(src net.Conn, primary net.Conn, mirrors []*mirrorWriter, writeTimeout, idleTimeout time.Duration, sid uint64, stats *sessionStats) {
+// Read-side idle detection is owned by src (see idleConn).
+func fanOut(src net.Conn, primary net.Conn, mirrors []*mirrorWriter, writeTimeout time.Duration, sid uint64, stats *sessionStats) {
 	buf := make([]byte, copyBufSize)
 
 	for {
-		// Set read deadline before blocking on Read
-		if idleTimeout > 0 {
-			if err := src.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
-				slog.Debug("failed to set read deadline", "sid", sid, "err", err)
-			}
-		}
-
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			data := buf[:n]
@@ -1106,8 +1281,8 @@ func fanOut(src net.Conn, primary net.Conn, mirrors []*mirrorWriter, writeTimeou
 				stats.setEndReason(reasonClientReset)
 				slog.Info("client connection reset", "sid", sid, "err", readErr)
 			} else if isTimeoutErr(readErr) {
-				stats.setEndReason(reasonClientIdle)
-				slog.Info("client idle timeout", "sid", sid, "err", readErr)
+				stats.setEndReason(reasonSessionIdle)
+				slog.Info("session idle timeout", "sid", sid, "err", readErr)
 			} else {
 				stats.setEndReason(reasonClientReadErr)
 				slog.Error("client read failed", "sid", sid, "op", "read", "err", readErr)
@@ -1122,8 +1297,8 @@ func fanOut(src net.Conn, primary net.Conn, mirrors []*mirrorWriter, writeTimeou
 // When esc is non-zero, escape sequences are handled (ESC+DELIM = literal DELIM).
 // partialPolicy controls handling of incomplete frames at EOF: "drop", "forward", or "error".
 // Primary write errors stop the operation. Mirror writes are non-blocking via channels.
-// idleTimeout sets read deadline on src to detect idle clients.
-func fanOutLines(src net.Conn, primary net.Conn, mirrors []*mirrorWriter, delim []byte, esc byte, maxFrameSize int, writeTimeout, idleTimeout time.Duration, partialPolicy string, sid uint64, stats *sessionStats) {
+// Read-side idle detection is owned by src (see idleConn).
+func fanOutLines(src net.Conn, primary net.Conn, mirrors []*mirrorWriter, delim []byte, esc byte, maxFrameSize int, writeTimeout time.Duration, partialPolicy string, sid uint64, stats *sessionStats) {
 	// Cap bufio buffer size - frame limit is enforced separately in read functions
 	bufSize := maxFrameSize
 	if bufSize > maxBufioSize {
@@ -1132,13 +1307,6 @@ func fanOutLines(src net.Conn, primary net.Conn, mirrors []*mirrorWriter, delim 
 	reader := bufio.NewReaderSize(src, bufSize)
 
 	for {
-		// Set read deadline before blocking on Read
-		if idleTimeout > 0 {
-			if err := src.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
-				slog.Debug("failed to set read deadline", "sid", sid, "err", err)
-			}
-		}
-
 		var frame []byte
 		var complete bool
 		var err error
@@ -1203,8 +1371,8 @@ func fanOutLines(src net.Conn, primary net.Conn, mirrors []*mirrorWriter, delim 
 				stats.setEndReason(reasonClientReset)
 				slog.Info("client connection reset", "sid", sid, "err", err)
 			} else if isTimeoutErr(err) {
-				stats.setEndReason(reasonClientIdle)
-				slog.Info("client idle timeout", "sid", sid, "err", err)
+				stats.setEndReason(reasonSessionIdle)
+				slog.Info("session idle timeout", "sid", sid, "err", err)
 			} else {
 				stats.setEndReason(reasonClientReadErr)
 				slog.Error("client read failed", "sid", sid, "op", "read", "err", err)

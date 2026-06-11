@@ -63,6 +63,7 @@ Flags:
 - `-m` - Mirror addresses (comma-separated); receive traffic but responses are discarded
 - `-loglevel` - Log level: `error`, `info` (default), `debug`
 - `-logformat` - Log format: `text` (default) or `json`
+- `-logfile` - Append logs to a file instead of stderr
 - `-line` - Enable line-oriented mode for text protocols (SMTP, FTP, IRC, etc.)
 - `-delim` - Line delimiter: `crlf` (default), `lf`, `cr`, `etx`, `eot`, or custom string
 - `-esc` - Escape character for framed protocols: `esc` (0x1B), `0x1b`, or custom byte
@@ -70,8 +71,9 @@ Flags:
 - `-partial` - Partial frame policy at EOF: `drop` (discard), `forward` (send anyway), `error` (log and close) (default: drop)
 - `-timeout` - Connection timeout for dialing primary and mirrors (default: 10s)
 - `-writetimeout` - Write timeout for sending data, minimum 5s enforced (default: 30s)
-- `-idletimeout` - Idle timeout for client and primary connections, 0 to disable (default: 2m)
+- `-idletimeout` - Session idle timeout: a session ends as idle only when *neither* direction has seen data for this long; 0 to disable (default: 2m)
 - `-mirrorbuf` - Buffer size for mirror write channels (default: 100)
+- `-mirrordrain` - How long to wait at session end for queued mirror data to flush; 0 drops it immediately (default: 5s)
 - `-shutdowntimeout` - Graceful shutdown timeout before force-closing connections (default: 30s)
 - `-maxconns` - Maximum concurrent client connections; `0` disables the limit (default: 1024)
 
@@ -137,9 +139,10 @@ $ tee-rex -l :5000 -p server:5000 -m mirror:5000 -line -delim '</data>'
 - Mirrors automatically reconnect on failure with exponential backoff (100ms to 5s)
 - If a mirror's buffer fills up (slow consumer), data is dropped for that mirror only
 - If a mirror write fails mid-stream, the in-flight chunk is dropped (counted in `mirror_drops`) and the mirror reconnects for later data — partial writes are never replayed, so a reconnected mirror resumes on a clean boundary
+- At session end, data still queued for mirrors is flushed for up to `-mirrordrain` (default 5s) before the mirror connection closes; anything left undelivered after that is counted in `mirror_drops`
 - Connections are properly cleaned up when either side disconnects; when the primary closes, the client side is torn down promptly rather than lingering until the idle timeout
 - TCP keepalive (30s) is enabled on all connections to detect dead peers
-- Idle connections are closed after the idle timeout (default: 2m)
+- Idle detection is session-wide: a session ends as idle (`session_idle`) only when *neither* direction has seen data for `-idletimeout` (default 2m). One-way traffic — e.g. a client heartbeating into a server that never responds, as in alarm-receiver protocols like FrontelGI — keeps the session alive
 - On SIGINT/SIGTERM, waits for active sessions to finish gracefully before force-closing
 
 ### Line mode vs raw mode
@@ -155,13 +158,13 @@ $ tee-rex -l :5000 -p server:5000 -m mirror:5000 -line -delim '</data>'
 
 ## Logging
 
-Logs are written to stderr in structured format (key=value pairs by default, or JSON with `-logformat=json`).
+Logs are written to stderr in structured format (key=value pairs by default, or JSON with `-logformat=json`). Use `-logfile` to append them to a file instead.
 
 ### Log levels
 
 - **error** - Only errors (primary failures, protocol violations)
 - **info** (default) - Session start/end with stats, primary connections, mirror state changes
-- **debug** - Frame-level logging, mirror reconnect attempts, dropped data
+- **debug** - Data received on either end (per chunk, both directions), frame-level forwarding, mirror write confirmations, mirror reconnect attempts, dropped data
 
 ### Example output
 
@@ -172,8 +175,10 @@ time=2024-01-15T10:30:00.001Z level=INFO msg="primary connected" sid=1 primary=l
 time=2024-01-15T10:30:00.002Z level=INFO msg="mirror up" sid=1 mirror=localhost:9091
 time=2024-01-15T10:30:05.123Z level=INFO msg="session ended" sid=1 client=127.0.0.1:52341 duration=5.122s bytes_in=1024 bytes_out=2048
 
-# With -loglevel=debug (shows frame-level details)
+# With -loglevel=debug (shows receive and frame-level details)
+time=2024-01-15T10:30:00.010Z level=DEBUG msg="data received" sid=1 from=client bytes=128
 time=2024-01-15T10:30:00.010Z level=DEBUG msg="frame forwarded" sid=1 size=128
+time=2024-01-15T10:30:00.011Z level=DEBUG msg="mirror write ok" sid=1 mirror=localhost:9091 bytes=128
 
 # JSON format (-logformat=json)
 {"time":"2024-01-15T10:30:00.000Z","level":"INFO","msg":"session started","sid":1,"client":"127.0.0.1:52341","primary":"localhost:9090"}
@@ -192,11 +197,12 @@ Each session logs a summary on close with:
 - `mirror_drops` - Data dropped due to slow mirrors or failed mirror writes
 
 The `reason` field is one of:
-- `client_eof`, `client_reset`, `client_idle`, `client_read_error` - client side closed, reset, went idle, or errored
+- `client_eof`, `client_reset`, `client_read_error` - client side closed, reset, or errored
 - `client_slow` - client too slow to drain responses (write timeout)
 - `client_write_error` - other failure writing back to the client
-- `primary_eof`, `primary_reset`, `primary_idle` - primary closed, reset, or went idle
+- `primary_eof`, `primary_reset` - primary closed or reset
 - `primary_dial_failed`, `primary_write_error`, `primary_read_error` - primary connection problems
+- `session_idle` - no data in either direction for `-idletimeout`
 - `frame_too_large`, `partial_frame` - line-mode framing violations
 
 ## License
