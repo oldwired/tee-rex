@@ -11,9 +11,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -299,16 +302,18 @@ func TestScaffolding(t *testing.T) {
 func TestValidateConfig(t *testing.T) {
 	crlf := []byte("\r\n")
 	tests := []struct {
-		name    string
-		line    bool
-		delim   []byte
-		esc     byte
-		partial string
-		listen  string
-		primary string
-		mirrors []string
-		maxF    int
-		wantErr bool
+		name      string
+		line      bool
+		delim     []byte
+		esc       byte
+		partial   string
+		listen    string
+		primary   string
+		mirrors   []string
+		maxF      int
+		mirrorBuf int           // 0 means "use a valid default" (100)
+		timeout   time.Duration // 0 means "use a valid default" (1s)
+		wantErr   bool
 	}{
 		{name: "valid raw", partial: "drop", listen: "localhost:8080", primary: "localhost:9090", maxF: 1024},
 		{name: "valid line crlf", line: true, delim: crlf, partial: "drop", listen: ":8080", primary: ":9090", maxF: 1024},
@@ -316,20 +321,39 @@ func TestValidateConfig(t *testing.T) {
 		{name: "empty delim raw mode ok", line: false, delim: []byte{}, partial: "drop", listen: ":8080", primary: ":9090", maxF: 1024},
 		{name: "esc needs single-byte delim", line: true, delim: crlf, esc: 0x1B, partial: "drop", listen: ":8080", primary: ":9090", maxF: 1024, wantErr: true},
 		{name: "esc with single-byte delim ok", line: true, delim: []byte{0x03}, esc: 0x1B, partial: "drop", listen: ":8080", primary: ":9090", maxF: 1024},
+		{name: "esc equal to delim rejected", line: true, delim: []byte{0x03}, esc: 0x03, partial: "drop", listen: ":8080", primary: ":9090", maxF: 1024, wantErr: true},
 		{name: "bad partial", partial: "nope", listen: ":8080", primary: ":9090", maxF: 1024, wantErr: true},
 		{name: "bad listen addr", partial: "drop", listen: "no-port", primary: ":9090", maxF: 1024, wantErr: true},
 		{name: "bad primary addr", partial: "drop", listen: ":8080", primary: "no-port", maxF: 1024, wantErr: true},
 		{name: "L5 bad mirror addr", partial: "drop", listen: ":8080", primary: ":9090", mirrors: []string{"ok:1", "bad"}, maxF: 1024, wantErr: true},
 		{name: "L5 good mirrors", partial: "drop", listen: ":8080", primary: ":9090", mirrors: []string{"a:1", "b:2"}, maxF: 1024},
 		{name: "non-positive maxframe", partial: "drop", listen: ":8080", primary: ":9090", maxF: 0, wantErr: true},
+		{name: "negative mirrorbuf rejected", partial: "drop", listen: ":8080", primary: ":9090", maxF: 1024, mirrorBuf: -1, wantErr: true},
+		{name: "negative timeout rejected", partial: "drop", listen: ":8080", primary: ":9090", maxF: 1024, timeout: -time.Second, wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateConfig(tc.line, tc.delim, tc.esc, tc.partial, tc.listen, tc.primary, tc.mirrors, tc.maxF)
+			mb := tc.mirrorBuf
+			if mb == 0 {
+				mb = 100
+			}
+			to := tc.timeout
+			if to == 0 {
+				to = time.Second
+			}
+			err := validateConfig(tc.line, tc.delim, tc.esc, tc.partial, tc.listen, tc.primary, tc.mirrors, tc.maxF, mb, to)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("validateConfig err=%v, wantErr=%v", err, tc.wantErr)
 			}
 		})
+	}
+
+	// Zero values can't be expressed through the defaulting table above.
+	if err := validateConfig(false, nil, 0, "drop", ":8080", ":9090", nil, 1024, 0, time.Second); err == nil {
+		t.Error("mirrorbuf 0 must be rejected (unbuffered channel drops most mirror traffic)")
+	}
+	if err := validateConfig(false, nil, 0, "drop", ":8080", ":9090", nil, 1024, 100, 0); err == nil {
+		t.Error("timeout 0 must be rejected (unbounded dials)")
 	}
 }
 
@@ -390,12 +414,27 @@ func TestParseDelimiter(t *testing.T) {
 		"cr":      {'\r'},
 		"etx":     {0x03},
 		"eot":     {0x04},
+		"0x03":    {0x03},            // hex, consistent with -esc
+		"0X03":    {0x03},            // case-insensitive hex
+		"0x0d0a":  {'\r', '\n'},      // multi-byte hex
 		"</data>": []byte("</data>"), // custom passthrough
 		"":        {},                // empty passthrough (rejected later by validateConfig in line mode)
 	}
 	for in, want := range cases {
-		if got := parseDelimiter(in); string(got) != string(want) {
+		got, err := parseDelimiter(in)
+		if err != nil {
+			t.Errorf("parseDelimiter(%q) unexpected error: %v", in, err)
+			continue
+		}
+		if string(got) != string(want) {
 			t.Errorf("parseDelimiter(%q)=%v want %v", in, got, want)
+		}
+	}
+
+	// Malformed hex must error instead of silently becoming a literal string.
+	for _, in := range []string{"0x", "0xzz", "0x123"} {
+		if _, err := parseDelimiter(in); err == nil {
+			t.Errorf("parseDelimiter(%q) should error on malformed hex", in)
 		}
 	}
 }
@@ -415,6 +454,7 @@ func TestParseEscape(t *testing.T) {
 		{in: "A", want: 'A'},
 		{in: "0xzz", wantErr: true},  // bad hex
 		{in: "0x1ff", wantErr: true}, // out of byte range
+		{in: "0x00", wantErr: true},  // collides with the "no escape" sentinel
 		{in: "ab", wantErr: true},    // multi-char, not esc/hex
 	}
 	for _, tc := range cases {
@@ -432,8 +472,9 @@ func TestParseEscape(t *testing.T) {
 func TestWriteAll(t *testing.T) {
 	t.Run("full write", func(t *testing.T) {
 		mc := &mockConn{}
-		if err := writeAll(mc, []byte("hello"), 0); err != nil {
-			t.Fatalf("err=%v", err)
+		n, err := writeAll(mc, []byte("hello"), 0)
+		if err != nil || n != 5 {
+			t.Fatalf("n=%d err=%v", n, err)
 		}
 		if got := string(mc.bytesWritten()); got != "hello" {
 			t.Fatalf("written %q", got)
@@ -448,8 +489,9 @@ func TestWriteAll(t *testing.T) {
 			}
 			return n, nil
 		}}
-		if err := writeAll(mc, []byte("hello"), 0); err != nil {
-			t.Fatalf("err=%v", err)
+		n, err := writeAll(mc, []byte("hello"), 0)
+		if err != nil || n != 5 {
+			t.Fatalf("n=%d err=%v", n, err)
 		}
 		if got := string(mc.bytesWritten()); got != "hello" {
 			t.Fatalf("written %q want hello", got)
@@ -461,23 +503,34 @@ func TestWriteAll(t *testing.T) {
 
 	t.Run("zero-write returns ErrShortWrite", func(t *testing.T) {
 		mc := &mockConn{onWrite: func(b []byte) (int, error) { return 0, nil }}
-		if err := writeAll(mc, []byte("x"), 0); err != io.ErrShortWrite {
+		if _, err := writeAll(mc, []byte("x"), 0); err != io.ErrShortWrite {
 			t.Fatalf("err=%v want ErrShortWrite", err)
 		}
 	})
 
-	t.Run("error is propagated", func(t *testing.T) {
+	t.Run("error reports bytes already written", func(t *testing.T) {
 		boom := errors.New("boom")
-		mc := &mockConn{onWrite: func(b []byte) (int, error) { return 0, boom }}
-		if err := writeAll(mc, []byte("x"), 0); err != boom {
+		calls := 0
+		mc := &mockConn{onWrite: func(b []byte) (int, error) {
+			calls++
+			if calls == 1 {
+				return 2, nil
+			}
+			return 0, boom
+		}}
+		n, err := writeAll(mc, []byte("hello"), 0)
+		if err != boom {
 			t.Fatalf("err=%v want boom", err)
+		}
+		if n != 2 {
+			t.Fatalf("n=%d want 2 (partially delivered bytes must be reported)", n)
 		}
 	})
 
 	t.Run("sets write deadline when timeout>0", func(t *testing.T) {
 		mc := &mockConn{}
 		before := time.Now()
-		if err := writeAll(mc, []byte("x"), 50*time.Millisecond); err != nil {
+		if _, err := writeAll(mc, []byte("x"), 50*time.Millisecond); err != nil {
 			t.Fatalf("err=%v", err)
 		}
 		d, ok := mc.firstNonZeroWriteDeadline()
@@ -491,7 +544,7 @@ func TestWriteAll(t *testing.T) {
 
 	t.Run("no deadline when timeout==0", func(t *testing.T) {
 		mc := &mockConn{}
-		_ = writeAll(mc, []byte("x"), 0)
+		_, _ = writeAll(mc, []byte("x"), 0)
 		if _, ok := mc.firstNonZeroWriteDeadline(); ok {
 			t.Fatal("did not expect a write deadline")
 		}
@@ -608,6 +661,15 @@ func TestErrorClassifiers(t *testing.T) {
 	if isTimeoutErr(errors.New("nope")) {
 		t.Error("plain error is not a timeout")
 	}
+	if !isDeadlineErr(fmt.Errorf("read: %w", os.ErrDeadlineExceeded)) {
+		t.Error("wrapped os.ErrDeadlineExceeded should be a deadline error")
+	}
+	if isDeadlineErr(timeoutError{msg: "i/o timeout"}) {
+		t.Error("a generic net.Error timeout (e.g. ETIMEDOUT) is NOT a deadline error")
+	}
+	if !isResetErr(fmt.Errorf("read: %w", syscall.ECONNRESET)) {
+		t.Error("errno-wrapped ECONNRESET should classify as reset (Windows compatibility)")
+	}
 }
 
 // bytesReader returns an io.Reader over b without importing bytes in many spots.
@@ -659,6 +721,30 @@ func TestCopyWithDeadlines(t *testing.T) {
 		}
 		if !isTimeoutErr(err) {
 			t.Fatalf("err=%v should unwrap to a timeout", err)
+		}
+	})
+
+	// Bytes delivered before a write failure must still be counted in the total
+	// (bytes_out reconciliation against the client's own accounting).
+	t.Run("partial delivery counted on write failure", func(t *testing.T) {
+		srcR, srcW := net.Pipe()
+		defer func() { _ = srcW.Close() }()
+		go func() { _, _ = srcW.Write([]byte("data")) }()
+		calls := 0
+		dst := &mockConn{onWrite: func(b []byte) (int, error) {
+			calls++
+			if calls == 1 {
+				return 2, nil
+			}
+			return 0, errors.New("client stalled")
+		}}
+		total, err := copyWithDeadlines(dst, srcR, time.Second)
+		var cwErr *clientWriteErr
+		if !errors.As(err, &cwErr) {
+			t.Fatalf("err=%v want *clientWriteErr", err)
+		}
+		if total != 2 {
+			t.Fatalf("total=%d want 2 (partially delivered bytes must count)", total)
 		}
 	})
 
@@ -739,7 +825,10 @@ func TestMirrorInterruptUnblocksWrite(t *testing.T) {
 	mw.connPtr.Store(&client)
 
 	writeErr := make(chan error, 1)
-	go func() { writeErr <- writeAll(client, []byte("blocked"), 10*time.Second) }()
+	go func() {
+		_, err := writeAll(client, []byte("blocked"), 10*time.Second)
+		writeErr <- err
+	}()
 
 	time.Sleep(20 * time.Millisecond) // let the write block
 	mw.interrupt()
@@ -786,7 +875,7 @@ func TestMirrorStopInterruptsStuckWrite(t *testing.T) {
 // TestHandleConnPrimaryGoneClientSilent covers M4: when the primary closes and
 // the client is silent, the session must tear down promptly even with idle
 // timeout disabled (pre-M4 it hung forever), and be attributed to the primary
-// (primary_eof), not client_idle.
+// (primary_eof), not a spurious client-side reason.
 func TestHandleConnPrimaryGoneClientSilent(t *testing.T) {
 	// Primary accepts then immediately closes -> proxy sees primary EOF.
 	primaryLn := startLoopback(t, func(c net.Conn) { _ = c.Close() })
@@ -810,8 +899,8 @@ func TestHandleConnPrimaryGoneClientSilent(t *testing.T) {
 		}
 	})
 
-	if strings.Contains(logs, "reason=client_idle") {
-		t.Errorf("end reason must not be client_idle when the primary closed:\n%s", logs)
+	if strings.Contains(logs, "reason="+reasonSessionIdle) {
+		t.Errorf("end reason must not be session_idle when the primary closed:\n%s", logs)
 	}
 	if !strings.Contains(logs, "reason=primary_eof") {
 		t.Errorf("expected reason=primary_eof:\n%s", logs)
@@ -1147,6 +1236,9 @@ func TestFanOutLinesFrameTooLarge(t *testing.T) {
 	if len(primary.bytesWritten()) != 0 {
 		t.Fatalf("oversized frame must not be forwarded, primary got %q", primary.bytesWritten())
 	}
+	if got := stats.bytesIn.Load(); got != 11 {
+		t.Fatalf("bytesIn=%d want 11 (oversized-frame bytes were read off the wire)", got)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1461,6 +1553,159 @@ func TestHandleConnMirrorGetsBurstBeforeClose(t *testing.T) {
 	defer mu.Unlock()
 	if string(got) != burst {
 		t.Fatalf("mirror got %q want the full burst %q", got, burst)
+	}
+}
+
+// TestIdleConnRealTimeoutSurfaces: a timeout-flavored error that is NOT a
+// deadline expiry (e.g. ETIMEDOUT from TCP keepalive detecting a dead peer)
+// must surface to the caller immediately — not be retried as a stale idle
+// deadline just because the other direction was recently active.
+func TestIdleConnRealTimeoutSurfaces(t *testing.T) {
+	reads := 0
+	mc := &mockConn{onRead: func(b []byte) (int, error) {
+		reads++
+		return 0, timeoutError{msg: "connection timed out"} // Timeout()==true, not a deadline
+	}}
+	activity := newActivityMonitor()
+	activity.touch() // session looks active: a deadline timeout WOULD be retried
+	ic := newIdleConn(mc, time.Hour, activity, 1, "primary")
+
+	_, err := ic.Read(make([]byte, 8))
+	if !isTimeoutErr(err) {
+		t.Fatalf("err=%v want the original timeout error", err)
+	}
+	if isDeadlineErr(err) {
+		t.Fatalf("test bug: fake error must not look like a deadline expiry")
+	}
+	if reads != 1 {
+		t.Fatalf("reads=%d want 1 (a real peer failure must not be retried)", reads)
+	}
+}
+
+// TestCloseAllConnsShutdownReason: force-close must attribute sessions to
+// shutdown (not client_eof/session_idle) and must not race a concurrent
+// registerPrimary (run with -race).
+func TestCloseAllConnsShutdownReason(t *testing.T) {
+	const sid = uint64(1 << 40) // out of the way of real session IDs
+	stats := &sessionStats{}
+	c1, c2 := &mockConn{}, &mockConn{}
+	registerConn(sid, c1, stats)
+	defer unregisterConn(sid)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		registerPrimary(sid, c2) // races closeAllConns' snapshot under -race
+	}()
+	closeAllConns()
+	wg.Wait()
+
+	if got := stats.getEndReason(); got != reasonShutdown {
+		t.Fatalf("reason=%q want %q", got, reasonShutdown)
+	}
+	if !c1.isClosed() {
+		t.Fatal("client conn must be force-closed")
+	}
+}
+
+// TestMirrorDialFailDropCounted: a chunk dropped because the mirror cannot be
+// dialed must be counted in mirror_drops (it used to vanish silently).
+func TestMirrorDialFailDropCounted(t *testing.T) {
+	stats := &sessionStats{}
+	mw := &mirrorWriter{
+		addr:         "127.0.0.1:1", // nothing listens here; dial fails fast
+		ch:           make(chan []byte, 4),
+		done:         make(chan struct{}),
+		connTimeout:  500 * time.Millisecond,
+		writeTimeout: 5 * time.Second,
+		sid:          1,
+		stats:        stats,
+	}
+	backoff := initialBackoff
+	mw.writeChunk([]byte("frame"), &backoff)
+	if got := stats.mirrorDrops.Load(); got != 1 {
+		t.Fatalf("mirrorDrops=%d want 1 (dial-failure drops must be counted)", got)
+	}
+	if got := mw.drops.Load(); got != 1 {
+		t.Fatalf("per-mirror drops=%d want 1", got)
+	}
+}
+
+// TestFanOutLinesPartialNotForwardedOnError: the -partial policy applies only
+// to a clean client EOF; a fragment interrupted by a session-idle (or any
+// other error) must never be forwarded, even with -partial forward.
+func TestFanOutLinesPartialNotForwardedOnError(t *testing.T) {
+	srcR, srcW := net.Pipe()
+	defer func() { _ = srcW.Close() }()
+	defer func() { _ = srcR.Close() }()
+	ic := newIdleConn(srcR, 60*time.Millisecond, newActivityMonitor(), 1, "client")
+	go func() { _, _ = srcW.Write([]byte("PARTIAL")) }() // no delimiter, then silence
+
+	primary := &mockConn{}
+	stats := &sessionStats{}
+	fanOutLines(ic, primary, nil, []byte("\r\n"), 0, defaultMaxLineLen, 5*time.Second, "forward", 1, stats)
+
+	if got := primary.bytesWritten(); len(got) != 0 {
+		t.Fatalf("fragment must not be forwarded on a mid-frame idle: %q", got)
+	}
+	if got := stats.getEndReason(); got != reasonSessionIdle {
+		t.Fatalf("reason=%q want %q", got, reasonSessionIdle)
+	}
+}
+
+// TestStatsAttrs smoke-checks the aggregate stats line content.
+func TestStatsAttrs(t *testing.T) {
+	aggBytesIn.Add(1)
+	mirrorDropsMu.Lock()
+	mirrorDropsByAddr["statstest:1"] = 7
+	mirrorDropsMu.Unlock()
+
+	attrs := statsAttrs()
+	var keys []string
+	for i := 0; i < len(attrs); i += 2 {
+		keys = append(keys, attrs[i].(string))
+	}
+	joined := strings.Join(keys, " ")
+	for _, want := range []string{"active_sessions", "total_sessions", "bytes_in", "bytes_out", "mirror_drops", "drops_statstest:1"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("stats attrs missing %q: %v", want, joined)
+		}
+	}
+}
+
+// TestReopenableWriter covers the SIGHUP log-rotation plumbing: after the file
+// is moved aside, Reopen() must start a fresh file at the original path.
+func TestReopenableWriter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	w, err := newReopenableWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if _, err := w.Write([]byte("before\n")); err != nil {
+		t.Fatal(err)
+	}
+	rotated := filepath.Join(dir, "test.log.1")
+	if err := os.Rename(path, rotated); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Reopen(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("after\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	old, _ := os.ReadFile(rotated)
+	cur, _ := os.ReadFile(path)
+	if string(old) != "before\n" {
+		t.Fatalf("rotated file content %q", old)
+	}
+	if string(cur) != "after\n" {
+		t.Fatalf("reopened file content %q", cur)
 	}
 }
 
