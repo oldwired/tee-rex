@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -243,6 +244,23 @@ func dialLoopback(t *testing.T, addr string) net.Conn {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	return c
+}
+
+// testSessionConfig returns a raw-mode session config with the timings most
+// handleConnection tests use: idle detection off, half-close support off (the
+// pre-#3 behavior: a primary close tears the session down at once, so tests
+// that don't care about half-close keep their expectations), 1s mirror drain.
+// Tests override what they exercise.
+func testSessionConfig(primaryAddr string) *sessionConfig {
+	return &sessionConfig{
+		primaryAddr:   primaryAddr,
+		maxFrameSize:  defaultMaxLineLen,
+		partialPolicy: "drop",
+		connTimeout:   time.Second,
+		writeTimeout:  5 * time.Second,
+		mirrorBufSize: 10,
+		mirrorDrain:   time.Second,
+	}
 }
 
 // waitGroupDone reports whether wg.Wait() returns within d.
@@ -683,7 +701,7 @@ func TestCopyWithDeadlines(t *testing.T) {
 			_, _ = srcW.Write([]byte("hello"))
 			_ = srcW.Close()
 		}()
-		n, err := copyWithDeadlines(dst, srcR, 5*time.Second)
+		n, err := copyWithDeadlines(dst, srcR, 5*time.Second, nil)
 		if err != nil || n != 5 || string(dst.bytesWritten()) != "hello" {
 			t.Fatalf("n=%d err=%v written=%q", n, err, dst.bytesWritten())
 		}
@@ -696,7 +714,7 @@ func TestCopyWithDeadlines(t *testing.T) {
 		// Idle detection lives in idleConn now; the monitor sees no activity in
 		// either direction, so the read times out as a genuine session idle.
 		src := newIdleConn(srcR, 30*time.Millisecond, newActivityMonitor(), 1, "primary")
-		n, err := copyWithDeadlines(dst, src, 5*time.Second)
+		n, err := copyWithDeadlines(dst, src, 5*time.Second, nil)
 		if n != 0 || !isTimeoutErr(err) {
 			t.Fatalf("n=%d err=%v want read timeout", n, err)
 		}
@@ -714,7 +732,7 @@ func TestCopyWithDeadlines(t *testing.T) {
 		dst := &mockConn{onWrite: func(b []byte) (int, error) {
 			return 0, timeoutError{msg: "i/o timeout"}
 		}}
-		_, err := copyWithDeadlines(dst, srcR, 50*time.Millisecond)
+		_, err := copyWithDeadlines(dst, srcR, 50*time.Millisecond, nil)
 		var cwErr *clientWriteErr
 		if !errors.As(err, &cwErr) {
 			t.Fatalf("err=%v want *clientWriteErr", err)
@@ -738,7 +756,7 @@ func TestCopyWithDeadlines(t *testing.T) {
 			}
 			return 0, errors.New("client stalled")
 		}}
-		total, err := copyWithDeadlines(dst, srcR, time.Second)
+		total, err := copyWithDeadlines(dst, srcR, time.Second, nil)
 		var cwErr *clientWriteErr
 		if !errors.As(err, &cwErr) {
 			t.Fatalf("err=%v want *clientWriteErr", err)
@@ -758,7 +776,7 @@ func TestCopyWithDeadlines(t *testing.T) {
 		}()
 		dst := &mockConn{}
 		before := time.Now()
-		if _, err := copyWithDeadlines(dst, srcR, 200*time.Millisecond); err != nil {
+		if _, err := copyWithDeadlines(dst, srcR, 200*time.Millisecond, nil); err != nil {
 			t.Fatalf("err=%v", err)
 		}
 		d, ok := dst.firstNonZeroWriteDeadline()
@@ -872,38 +890,185 @@ func TestMirrorStopInterruptsStuckWrite(t *testing.T) {
 	}
 }
 
-// TestHandleConnPrimaryGoneClientSilent covers M4: when the primary closes and
-// the client is silent, the session must tear down promptly even with idle
-// timeout disabled (pre-M4 it hung forever), and be attributed to the primary
-// (primary_eof), not a spurious client-side reason.
+// TestHandleConnPrimaryGoneClientSilent covers M4 under the half-close
+// contract (issue #3): when the primary closes and the client is silent, the
+// session must still tear down promptly even with idle timeout disabled — with
+// half-close support the bound is -halfclosetimeout (reason
+// half_close_timeout); with it disabled (0) teardown is immediate and
+// attributed to the primary (primary_eof). Never session_idle.
 func TestHandleConnPrimaryGoneClientSilent(t *testing.T) {
-	// Primary accepts then immediately closes -> proxy sees primary EOF.
-	primaryLn := startLoopback(t, func(c net.Conn) { _ = c.Close() })
+	cases := []struct {
+		name       string
+		halfClose  time.Duration
+		wantReason string
+	}{
+		{"half-close bound", 100 * time.Millisecond, reasonHalfCloseIdle},
+		{"half-close disabled", 0, reasonPrimaryEOF},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Primary accepts then immediately closes -> proxy sees primary EOF.
+			primaryLn := startLoopback(t, func(c net.Conn) { _ = c.Close() })
 
-	// Real client/proxy conn pair; `client` stays silent (never writes/closes).
+			// Real client/proxy conn pair; `client` stays silent (never writes/closes).
+			client, in := tcpConnPair(t)
+			_ = client
+
+			cfg := testSessionConfig(primaryLn.Addr().String())
+			cfg.halfCloseTimeout = tc.halfClose // idleTimeout stays 0
+			logs := captureLogs(t, func() {
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					handleConnection(in, cfg, nil)
+				}()
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+					t.Fatal("handleConnection did not return: fanOut still blocked on a silent client (M4 regression)")
+				}
+			})
+
+			if strings.Contains(logs, "reason="+reasonSessionIdle) {
+				t.Errorf("end reason must not be session_idle when the primary closed:\n%s", logs)
+			}
+			if !strings.Contains(logs, "reason="+tc.wantReason) {
+				t.Errorf("expected reason=%s:\n%s", tc.wantReason, logs)
+			}
+		})
+	}
+}
+
+// TestHandleConnPrimaryHalfCloseThenUpload is the issue #3 integration test:
+// the primary announces READY, closes its write side and keeps reading; the
+// client sees READY + EOF and only then uploads. A transparent TCP proxy must
+// deliver that upload — TCP EOF is directional.
+func TestHandleConnPrimaryHalfCloseThenUpload(t *testing.T) {
+	upload := bytes.Repeat([]byte("upload-"), 64*1024) // ~448 KiB: spans many chunks
+	gotUpload := make(chan []byte, 1)
+	primaryLn := startLoopback(t, func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		if _, err := c.Write([]byte("READY")); err != nil {
+			return
+		}
+		_ = c.(*net.TCPConn).CloseWrite() // done talking, still listening
+		data, _ := io.ReadAll(c)
+		gotUpload <- data
+	})
 	client, in := tcpConnPair(t)
-	_ = client
 
+	cfg := testSessionConfig(primaryLn.Addr().String())
+	cfg.halfCloseTimeout = 5 * time.Second
+	done := make(chan struct{})
+	logs := captureLogs(t, func() {
+		go func() {
+			defer close(done)
+			handleConnection(in, cfg, nil)
+		}()
+
+		// Client: read READY and the relayed EOF first.
+		_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+		banner, err := io.ReadAll(client)
+		if err != nil || string(banner) != "READY" {
+			t.Fatalf("client banner: %q err=%v (primary half-close not relayed?)", banner, err)
+		}
+		// Then upload — through the proxy this used to arrive empty.
+		if _, err := client.Write(upload); err != nil {
+			t.Fatalf("upload write after primary EOF failed: %v (client read was unblocked)", err)
+		}
+		_ = client.Close()
+
+		select {
+		case data := <-gotUpload:
+			if !bytes.Equal(data, upload) {
+				t.Fatalf("primary received %d upload bytes, want %d", len(data), len(upload))
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("primary never received the upload")
+		}
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("session did not end after both peers closed")
+		}
+	})
+	// The primary closed first, then the client finished cleanly: attributed
+	// to the primary, not to a timeout.
+	if !strings.Contains(logs, "reason="+reasonPrimaryEOF) {
+		t.Errorf("want reason=primary_eof:\n%s", logs)
+	}
+}
+
+// TestHandleConnClientEOFPrimarySilent: the mirror-image half-close bound.
+// After a clean client EOF the primary may still answer, but a primary that
+// neither answers nor closes must not hold the session open forever when idle
+// detection is disabled (pre-#3 this hung until the idle timeout, or forever
+// with -idletimeout 0).
+func TestHandleConnClientEOFPrimarySilent(t *testing.T) {
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	primaryLn := startLoopback(t, func(c net.Conn) {
+		_, _ = io.Copy(io.Discard, c) // consume until client EOF ...
+		<-hold                        // ... then stay open and silent
+		_ = c.Close()
+	})
+	client, in := tcpConnPair(t)
+
+	cfg := testSessionConfig(primaryLn.Addr().String())
+	cfg.halfCloseTimeout = 100 * time.Millisecond
 	logs := captureLogs(t, func() {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			// idleTimeout = 0 -> without M4 this never returns.
-			handleConnection(in, primaryLn.Addr().String(), nil, false, nil, 0,
-				defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 0, time.Second)
+			handleConnection(in, cfg, nil)
 		}()
+		if _, err := client.Write([]byte("REQ")); err != nil {
+			t.Fatal(err)
+		}
+		_ = client.(*net.TCPConn).CloseWrite()
 		select {
 		case <-done:
 		case <-time.After(3 * time.Second):
-			t.Fatal("handleConnection did not return: fanOut still blocked on a silent client (M4 regression)")
+			t.Fatal("session did not end: silent half-closed primary held it open")
 		}
 	})
-
-	if strings.Contains(logs, "reason="+reasonSessionIdle) {
-		t.Errorf("end reason must not be session_idle when the primary closed:\n%s", logs)
+	if !strings.Contains(logs, "reason="+reasonHalfCloseIdle) {
+		t.Errorf("want reason=half_close_timeout:\n%s", logs)
 	}
-	if !strings.Contains(logs, "reason=primary_eof") {
-		t.Errorf("expected reason=primary_eof:\n%s", logs)
+}
+
+// TestHandleConnClientEOFLateResponse: a late primary response after the
+// client's half-close is still delivered within the half-close window (the
+// timeout is an idle bound, not an absolute one).
+func TestHandleConnClientEOFLateResponse(t *testing.T) {
+	primaryLn := startLoopback(t, func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		_, _ = io.Copy(io.Discard, c) // wait for client EOF
+		time.Sleep(150 * time.Millisecond)
+		_, _ = c.Write([]byte("LATE"))
+	})
+	client, in := tcpConnPair(t)
+
+	cfg := testSessionConfig(primaryLn.Addr().String())
+	cfg.halfCloseTimeout = 2 * time.Second
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleConnection(in, cfg, nil)
+	}()
+	if _, err := client.Write([]byte("REQ")); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.(*net.TCPConn).CloseWrite()
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := io.ReadAll(client)
+	if err != nil || string(resp) != "LATE" {
+		t.Fatalf("late response: %q err=%v", resp, err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("session did not end")
 	}
 }
 
@@ -920,7 +1085,7 @@ func TestAcceptLoopBackoff(t *testing.T) {
 		return nil, net.ErrClosed // shutdown after 3 failures
 	}
 	var handled int
-	handle := func(net.Conn) { handled++ }
+	handle := func(net.Conn, func()) { handled++ }
 	var sleeps []time.Duration
 	sleep := func(d time.Duration) { sleeps = append(sleeps, d) }
 
@@ -959,7 +1124,7 @@ func TestAcceptLoopSessionAccounting(t *testing.T) {
 	}
 	release := make(chan struct{})
 	handleStarted := make(chan struct{})
-	handle := func(net.Conn) {
+	handle := func(net.Conn, func()) {
 		close(handleStarted)
 		<-release
 	}
@@ -1001,7 +1166,7 @@ func TestAcceptLoopMaxConns(t *testing.T) {
 	}
 	release := make(chan struct{})
 	var handled, completed int32
-	handle := func(net.Conn) {
+	handle := func(net.Conn, func()) {
 		atomic.AddInt32(&handled, 1)
 		<-release
 		atomic.AddInt32(&completed, 1)
@@ -1048,9 +1213,10 @@ func TestAcceptLoopShutdownSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handle := func(c net.Conn) {
-		handleConnection(c, primaryLn.Addr().String(), nil, false, nil, 0,
-			defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 2*time.Second, time.Second)
+	cfg := testSessionConfig(primaryLn.Addr().String())
+	cfg.idleTimeout = 2 * time.Second
+	handle := func(c net.Conn, release func()) {
+		handleConnection(c, cfg, release)
 	}
 	accepting := make(chan struct{})
 	go func() { defer close(accepting); acceptLoop(l.Accept, handle, time.Sleep, 0) }()
@@ -1343,12 +1509,13 @@ func TestHandleConnSilentPrimaryActiveClient(t *testing.T) {
 	})
 	client, in := tcpConnPair(t)
 
+	cfg := testSessionConfig(primaryLn.Addr().String())
+	cfg.idleTimeout = 80 * time.Millisecond
 	done := make(chan struct{})
 	logs := captureLogs(t, func() {
 		go func() {
 			defer close(done)
-			handleConnection(in, primaryLn.Addr().String(), nil, false, nil, 0,
-				defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 80*time.Millisecond, time.Second)
+			handleConnection(in, cfg, nil)
 		}()
 		// Heartbeat every 20ms for ~400ms — five times the idle timeout. The
 		// primary direction is silent throughout.
@@ -1392,12 +1559,13 @@ func TestHandleConnSessionIdleBothDirections(t *testing.T) {
 	client, in := tcpConnPair(t)
 	_ = client // stays silent
 
+	cfg := testSessionConfig(primaryLn.Addr().String())
+	cfg.idleTimeout = 60 * time.Millisecond
 	logs := captureLogs(t, func() {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			handleConnection(in, primaryLn.Addr().String(), nil, false, nil, 0,
-				defaultMaxLineLen, "drop", time.Second, 5*time.Second, 10, 60*time.Millisecond, time.Second)
+			handleConnection(in, cfg, nil)
 		}()
 		select {
 		case <-done:
@@ -1521,12 +1689,16 @@ func TestHandleConnMirrorGetsBurstBeforeClose(t *testing.T) {
 
 	client, in := tcpConnPair(t)
 
+	cfg := testSessionConfig(primaryLn.Addr().String())
+	cfg.mirrorAddrs = []string{mirrorLn.Addr().String()}
+	cfg.lineMode = true
+	cfg.delim = []byte{0x03}
+	cfg.mirrorBufSize = 16
+	cfg.mirrorDrain = 2 * time.Second
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleConnection(in, primaryLn.Addr().String(), []string{mirrorLn.Addr().String()},
-			true, []byte{0x03}, 0, defaultMaxLineLen, "drop",
-			time.Second, 5*time.Second, 16, 0, 2*time.Second)
+		handleConnection(in, cfg, nil)
 	}()
 
 	burst := ""
@@ -1657,9 +1829,7 @@ func TestFanOutLinesPartialNotForwardedOnError(t *testing.T) {
 // TestStatsAttrs smoke-checks the aggregate stats line content.
 func TestStatsAttrs(t *testing.T) {
 	aggBytesIn.Add(1)
-	mirrorDropsMu.Lock()
-	mirrorDropsByAddr["statstest:1"] = 7
-	mirrorDropsMu.Unlock()
+	mirrorDropCounter("statstest:1").Store(7)
 
 	attrs := statsAttrs()
 	var keys []string
@@ -1728,5 +1898,448 @@ func TestBuildLogHandler(t *testing.T) {
 	slog.New(buildLogHandler(&buf, "error", "text")).Info("hidden")
 	if buf.Len() != 0 {
 		t.Fatalf("info must be suppressed at error level: %q", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// D-suite: GitHub issues #1–#5 (mirror response draining, admission slot vs.
+// mirror cleanup, half-close, live stats, full-queue drop cost).
+// ---------------------------------------------------------------------------
+
+// sinkConn is a mockConn that records nothing (no write copies, no deadline
+// history), for allocation-sensitive tests and benchmarks where mockConn's
+// bookkeeping would dominate.
+type sinkConn struct{ mockConn }
+
+func (s *sinkConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (s *sinkConn) SetWriteDeadline(time.Time) error { return nil }
+func (s *sinkConn) SetReadDeadline(time.Time) error  { return nil }
+
+// fullQueueMirror returns a mirrorWriter whose queue is already full and that
+// has no run() goroutine, so every send() takes the buffer-full drop path.
+func fullQueueMirror() *mirrorWriter {
+	mw := &mirrorWriter{addr: "full:0", ch: make(chan []byte, 1), done: make(chan struct{}), stats: &sessionStats{}}
+	mw.send([]byte("x")) // occupies the single slot
+	return mw
+}
+
+// TestMirrorSendFullQueueNoAlloc (issue #5): dropping because the mirror queue
+// is full must not allocate or copy the payload — that work would land on the
+// client→primary forwarding goroutine exactly when the mirror is overloaded.
+func TestMirrorSendFullQueueNoAlloc(t *testing.T) {
+	mw := fullQueueMirror()
+	data := make([]byte, copyBufSize)
+	before := mw.stats.mirrorDrops.Load()
+	allocs := testing.AllocsPerRun(1000, func() { mw.send(data) })
+	if allocs != 0 {
+		t.Fatalf("full-queue send allocates %.1f objects/op, want 0", allocs)
+	}
+	if got := mw.stats.mirrorDrops.Load() - before; got != 1001 { // 1 warm-up + 1000 runs
+		t.Fatalf("drops=%d want 1001 (every full-queue send must still be counted)", got)
+	}
+}
+
+// TestMirrorSendNonFullQueueEnqueues guards the fast-path check in send():
+// a queue observed non-full must enqueue a private copy (the caller's buffer
+// is reused), never drop.
+func TestMirrorSendNonFullQueueEnqueues(t *testing.T) {
+	mw := &mirrorWriter{addr: "q:0", ch: make(chan []byte, 2), done: make(chan struct{}), stats: &sessionStats{}}
+	buf := []byte("first")
+	mw.send(buf)
+	copy(buf, "XXXXX") // caller reuses its buffer
+	mw.send([]byte("second"))
+	mw.send([]byte("third")) // full: dropped
+	if got := mw.stats.mirrorDrops.Load(); got != 1 {
+		t.Fatalf("drops=%d want 1", got)
+	}
+	if got := string(<-mw.ch); got != "first" {
+		t.Fatalf("queued %q want an independent copy of \"first\"", got)
+	}
+	if got := string(<-mw.ch); got != "second" {
+		t.Fatalf("queued %q want second", got)
+	}
+}
+
+// BenchmarkMirrorSendFullQueue (issue #5) tracks the cost of the buffer-full
+// drop path; expect 0 B/op and 0 allocs/op.
+func BenchmarkMirrorSendFullQueue(b *testing.B) {
+	mw := fullQueueMirror()
+	data := make([]byte, copyBufSize)
+	b.ReportAllocs()
+	b.SetBytes(copyBufSize)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mw.send(data)
+	}
+}
+
+// chunkSource returns a mockConn that yields n full read buffers and then EOF.
+func chunkSource(n int) *mockConn {
+	i := 0
+	return &mockConn{onRead: func(b []byte) (int, error) {
+		if i >= n {
+			return 0, io.EOF
+		}
+		i++
+		return len(b), nil
+	}}
+}
+
+// TestFanOutStalledMirrorNoPerChunkAllocs (issue #5, sustained overload):
+// with a mirror that drops every chunk, the primary forwarding path must do no
+// per-chunk work proportional to the discarded payload — allocations must not
+// grow with the number of chunks.
+func TestFanOutStalledMirrorNoPerChunkAllocs(t *testing.T) {
+	run := func(chunks int) float64 {
+		return testing.AllocsPerRun(20, func() {
+			mw := fullQueueMirror()
+			fanOut(chunkSource(chunks), &sinkConn{}, []*mirrorWriter{mw}, 5*time.Second, 1, &sessionStats{})
+		})
+	}
+	one, many := run(1), run(500)
+	if many-one > 1 {
+		t.Fatalf("allocs grew with chunk count on a stalled mirror: 1 chunk=%.1f, 500 chunks=%.1f", one, many)
+	}
+}
+
+// BenchmarkFanOutStalledMirror vs BenchmarkFanOutNoMirror (issue #5): the
+// per-chunk cost of forwarding with a mirror that drops everything should be
+// close to forwarding with no mirror at all.
+func BenchmarkFanOutStalledMirror(b *testing.B) {
+	mw := fullQueueMirror()
+	src := chunkSource(b.N)
+	b.ReportAllocs()
+	b.SetBytes(copyBufSize)
+	b.ResetTimer()
+	fanOut(src, &sinkConn{}, []*mirrorWriter{mw}, 5*time.Second, 1, &sessionStats{})
+}
+
+func BenchmarkFanOutNoMirror(b *testing.B) {
+	src := chunkSource(b.N)
+	b.ReportAllocs()
+	b.SetBytes(copyBufSize)
+	b.ResetTimer()
+	fanOut(src, &sinkConn{}, nil, 5*time.Second, 1, &sessionStats{})
+}
+
+// TestAggregateStatsLiveDuringSession (issue #4): the process byte counters
+// behind the periodic stats line must grow while a long-lived session is still
+// open, and the final totals must equal the traffic exactly (no double count
+// when the session closes).
+func TestAggregateStatsLiveDuringSession(t *testing.T) {
+	primaryLn := startLoopback(t, func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		_, _ = io.Copy(c, c) // echo
+	})
+	client, in := tcpConnPair(t)
+
+	inBefore, outBefore := aggBytesIn.Load(), aggBytesOut.Load()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleConnection(in, testSessionConfig(primaryLn.Addr().String()), nil)
+	}()
+
+	const n = 4096
+	if _, err := client.Write(make([]byte, n)); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(client, make([]byte, n)); err != nil {
+		t.Fatalf("echo: %v", err)
+	}
+	// Still connected: the aggregates must already reflect the traffic.
+	eventually(t, 2*time.Second, func() bool {
+		return aggBytesIn.Load()-inBefore >= n && aggBytesOut.Load()-outBefore >= n
+	}, "aggregate byte counters did not grow while the session was open")
+
+	_ = client.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("session did not end")
+	}
+	if got := aggBytesIn.Load() - inBefore; got != n {
+		t.Fatalf("bytes_in delta=%d want %d (double counted at session end?)", got, n)
+	}
+	if got := aggBytesOut.Load() - outBefore; got != n {
+		t.Fatalf("bytes_out delta=%d want %d (double counted at session end?)", got, n)
+	}
+}
+
+// stalledMirror starts a mirror that accepts connections and never reads them
+// (released on test cleanup), so the mirror writer ends the session with a
+// full queue and a blocked in-flight write — a drain that cannot finish early.
+func stalledMirror(t *testing.T) net.Listener {
+	t.Helper()
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	return startLoopback(t, func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		<-hold
+	})
+}
+
+// bigUpload is large enough to exceed any loopback socket buffer, so a mirror
+// that never reads leaves the writer blocked with data still queued.
+var bigUpload = make([]byte, 16<<20)
+
+// TestMaxConnsNotHeldByMirrorDrain (issue #2): with -maxconns 1, a session
+// whose client/primary traffic is complete but whose mirror is still draining
+// must not block the next client.
+func TestMaxConnsNotHeldByMirrorDrain(t *testing.T) {
+	primaryLn := startLoopback(t, func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		_, _ = io.Copy(io.Discard, c) // consume the upload until client EOF
+		_, _ = c.Write([]byte("OK"))
+	})
+	mirrorLn := stalledMirror(t)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testSessionConfig(primaryLn.Addr().String())
+	cfg.mirrorAddrs = []string{mirrorLn.Addr().String()}
+	cfg.mirrorBufSize = 1024 // queue holds the whole upload: the drain has real work
+	cfg.mirrorDrain = 2 * time.Second
+	accepting := make(chan struct{})
+	go func() {
+		defer close(accepting)
+		acceptLoop(l.Accept, func(c net.Conn, release func()) { handleConnection(c, cfg, release) }, time.Sleep, 1)
+	}()
+
+	roundTrip := func(payload []byte) bool {
+		c, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			t.Logf("dial: %v", err)
+			return false
+		}
+		defer func() { _ = c.Close() }()
+		if _, err := c.Write(payload); err != nil {
+			t.Logf("write: %v", err)
+			return false
+		}
+		_ = c.(*net.TCPConn).CloseWrite()
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		resp, err := io.ReadAll(c)
+		if err != nil || string(resp) != "OK" {
+			t.Logf("response %q err=%v", resp, err)
+			return false
+		}
+		return true
+	}
+
+	if !roundTrip(bigUpload) {
+		t.Fatal("first session failed")
+	}
+	// Session 1's mirror is now draining against a stalled mirror. A second
+	// client must be admitted well before -mirrordrain expires.
+	eventually(t, time.Second, func() bool { return roundTrip([]byte("second")) },
+		"second client was rejected: the -maxconns slot is still held by mirror cleanup")
+
+	_ = l.Close()
+	<-accepting
+	if !waitGroupDone(&activeSessions, 6*time.Second) {
+		t.Fatal("sessions did not finish after the drain window")
+	}
+}
+
+// TestMirrorDrainBudgetShedsMirrorWork (issue #2): when the drain budget is
+// exhausted, a finishing session drops its queued mirror data (counted) and
+// returns immediately instead of waiting out -mirrordrain.
+func TestMirrorDrainBudgetShedsMirrorWork(t *testing.T) {
+	setDrainBudget(1)
+	t.Cleanup(func() { setDrainBudget(0) })
+	*drainSlots.Load() <- struct{}{} // budget fully occupied by "another" session
+
+	primaryLn := startLoopback(t, func(c net.Conn) {
+		_, _ = io.Copy(io.Discard, c)
+		_ = c.Close()
+	})
+	mirrorLn := stalledMirror(t)
+	client, in := tcpConnPair(t)
+
+	cfg := testSessionConfig(primaryLn.Addr().String())
+	cfg.mirrorAddrs = []string{mirrorLn.Addr().String()}
+	cfg.mirrorBufSize = 1024
+	cfg.mirrorDrain = 5 * time.Second
+	done := make(chan struct{})
+	logs := captureLogs(t, func() {
+		go func() {
+			defer close(done)
+			handleConnection(in, cfg, nil)
+		}()
+		if _, err := client.Write(bigUpload); err != nil {
+			t.Fatal(err)
+		}
+		_ = client.Close()
+		start := time.Now()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("handleConnection waited for the drain despite an exhausted drain budget")
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Fatalf("teardown took %v; want immediate shedding", d)
+		}
+	})
+	if !strings.Contains(logs, "mirror_drops=") || strings.Contains(logs, "mirror_drops=0 ") || strings.HasSuffix(strings.TrimSpace(logs), "mirror_drops=0") {
+		t.Errorf("shed mirror data must be counted in mirror_drops:\n%s", logs)
+	}
+}
+
+// TestMirrorStopCancelsDial (issue #2): stop() must abort an in-flight mirror
+// dial (DNS/connect) promptly instead of letting the session wait out -timeout.
+func TestMirrorStopCancelsDial(t *testing.T) {
+	var wg sync.WaitGroup
+	mw := newMirrorWriter("slow.invalid:1", &wg, 30*time.Second, 5*time.Second, 4, 1, &sessionStats{})
+	dialing := make(chan struct{})
+	mw.dial = func(ctx context.Context, addr string) (net.Conn, error) {
+		close(dialing)
+		<-ctx.Done() // a connect that only ends when cancelled
+		return nil, ctx.Err()
+	}
+	mw.send([]byte("x")) // triggers the dial
+	select {
+	case <-dialing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dial never started")
+	}
+
+	start := time.Now()
+	mw.stop()
+	if !waitGroupDone(&wg, 2*time.Second) {
+		t.Fatal("mirror goroutine did not exit: in-flight dial was not cancelled by stop()")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("stop took %v with a 30s dial timeout; want prompt cancellation", d)
+	}
+	if got := mw.stats.mirrorDrops.Load(); got != 1 {
+		t.Fatalf("drops=%d want 1 (the undelivered chunk)", got)
+	}
+}
+
+// TestMirrorResponsesDiscarded (issue #1): a request/response mirror that
+// answers every request with more than a socket buffer's worth of data must
+// keep receiving later requests. Without a discard reader its response write
+// blocks, it stops reading, and the mirrored stream stalls.
+func TestMirrorResponsesDiscarded(t *testing.T) {
+	var received atomic.Int64
+	response := make([]byte, 16<<20)
+	mirrorLn := startLoopback(t, func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		one := make([]byte, 1)
+		for {
+			if _, err := io.ReadFull(c, one); err != nil {
+				return
+			}
+			received.Add(1)
+			if _, err := c.Write(response); err != nil { // blocks unless someone reads
+				return
+			}
+		}
+	})
+
+	var wg sync.WaitGroup
+	mw := newMirrorWriter(mirrorLn.Addr().String(), &wg, time.Second, 5*time.Second, 16, 1, &sessionStats{})
+	const requests = 4
+	for i := 1; i <= requests; i++ {
+		mw.send([]byte{'r'})
+		eventually(t, 5*time.Second, func() bool { return received.Load() >= int64(i) },
+			fmt.Sprintf("mirror never received request %d: its response write is stuck (responses not drained)", i))
+	}
+	mw.beginDrain()
+	if !waitGroupDone(&wg, 3*time.Second) {
+		t.Fatal("mirror writer (and its response reader) did not exit after drain")
+	}
+	if got := mw.stats.mirrorDrops.Load(); got != 0 {
+		t.Fatalf("drops=%d want 0", got)
+	}
+}
+
+// TestMirrorStaleReaderDoesNotAffectReconnect (issue #1): a response reader
+// from a previous mirror connection that exits only after a new connection is
+// already established must not close or clear the new connection.
+func TestMirrorStaleReaderDoesNotAffectReconnect(t *testing.T) {
+	release := make(chan struct{})
+	old := &mockConn{onRead: func(b []byte) (int, error) {
+		<-release // the old reader lingers until we say so
+		return 0, io.EOF
+	}}
+	next := &mockConn{}
+	var oldConn net.Conn = old
+	mw := &mirrorWriter{addr: "test:0", writeTimeout: time.Second, stats: &sessionStats{}, done: make(chan struct{}), conn: old}
+	mw.connPtr.Store(&oldConn)
+	mw.startDiscardReader(old)
+
+	// The old connection fails and the writer reconnects to `next`.
+	mw.markDown()
+	mw.dial = func(context.Context, string) (net.Conn, error) { return next, nil }
+	backoff := initialBackoff
+	mw.writeChunk([]byte("data"), &backoff)
+	if mw.conn != next {
+		t.Fatal("writer did not reconnect to the new connection")
+	}
+
+	// Now the stale reader exits — after the reconnect.
+	close(release)
+	mw.readers.Wait()
+
+	if mw.conn != next {
+		t.Fatal("stale reader cleared the reconnected connection")
+	}
+	if next.isClosed() {
+		t.Fatal("stale reader closed the reconnected connection")
+	}
+	if p := mw.connPtr.Load(); p == nil || *p != net.Conn(next) {
+		t.Fatal("connPtr no longer points at the reconnected connection")
+	}
+	if got := string(next.bytesWritten()); got != "data" {
+		t.Fatalf("new connection got %q want data", got)
+	}
+	if !old.isClosed() {
+		t.Fatal("old connection should have been closed by markDown")
+	}
+}
+
+// TestIdleConnEnterHalfClose (issue #3) unit-tests the half-close bound on
+// idleConn: with idle detection off, a blocked Read returns
+// errHalfCloseTimeout after the half-close timeout, and data arriving within
+// the window is delivered and refreshes the bound.
+func TestIdleConnEnterHalfClose(t *testing.T) {
+	srcR, srcW := net.Pipe()
+	defer func() { _ = srcW.Close() }()
+	defer func() { _ = srcR.Close() }()
+	ic := newIdleConn(srcR, 0, newActivityMonitor(), 1, "client") // idle disabled
+
+	result := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8)
+		for {
+			if _, err := ic.Read(buf); err != nil {
+				result <- err
+				return
+			}
+		}
+	}()
+	time.Sleep(20 * time.Millisecond) // Read is blocked with no deadline
+	ic.enterHalfClose(120 * time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
+	if _, err := srcW.Write([]byte("more")); err != nil { // within the window: refreshes it
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("read ended early with %v; data within the window must keep the direction open", err)
+	case <-time.After(90 * time.Millisecond):
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, errHalfCloseTimeout) {
+			t.Fatalf("err=%v want errHalfCloseTimeout", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("half-close bound never fired on a blocked read")
 	}
 }

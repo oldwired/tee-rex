@@ -1,10 +1,14 @@
 .PHONY: build build-version test race lint vet fmt install
 
-# Version metadata stamped into main.BuildCommit / main.BuildTime so a
-# `make build-version` binary reports its provenance via `tee-rex -version`.
-COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null)
-TIME   ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS = -X main.BuildCommit=$(COMMIT) -X main.BuildTime=$(TIME)
+# Version metadata stamped into main.Version / main.BuildCommit /
+# main.BuildTime so a `make build-version` binary reports its provenance via
+# `tee-rex -version`. VERSION comes from `git describe` (e.g. 1.1.0,
+# 1.1.0-3-gabc1234-dirty) with the leading v stripped; the source default is
+# "dev". The Release workflow stamps VERSION from the pushed tag instead.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//')
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null)
+TIME    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS = -X main.Version=$(VERSION) -X main.BuildCommit=$(COMMIT) -X main.BuildTime=$(TIME)
 
 build:
 	go build .

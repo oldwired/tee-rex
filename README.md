@@ -42,12 +42,18 @@ $ go build .
 
 ### Build with version info
 
-Embed git commit and build time in the binary:
+A plain `go build` reports version `dev`. Release binaries have the version stamped from the Git tag by the release workflow (tag `v1.2.3` → `1.2.3`), which also runs the binary and fails the release if the reported version doesn't match the tag. To stamp a local build the same way:
 
 ```
-$ go build -ldflags "-X main.BuildCommit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
+$ make build-version          # version from `git describe --tags`, plus commit and build time
 $ ./tee-rex -version
-1.0.0 (abc1234 2024-01-15T10:30:00Z)
+1.1.0 (abc1234 2024-01-15T10:30:00Z)
+```
+
+or by hand:
+
+```
+$ go build -ldflags "-X main.Version=1.2.3 -X main.BuildCommit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
 ```
 
 ## Usage
@@ -72,8 +78,10 @@ Flags:
 - `-timeout` - Connection timeout for dialing primary and mirrors; must be positive (default: 10s)
 - `-writetimeout` - Write timeout for sending data, minimum 5s enforced with a warning (default: 30s)
 - `-idletimeout` - Session idle timeout: a session ends as idle only when *neither* direction has seen data for this long; 0 to disable (default: 2m)
+- `-halfclosetimeout` - After one peer closes its side (TCP half-close), keep relaying the other direction until it too closes or carries no data for this long; `0` disables half-close support (default: 30s)
 - `-mirrorbuf` - Buffer size for mirror write channels; must be at least 1 (default: 100)
 - `-mirrordrain` - How long to wait at session end for queued mirror data to flush; 0 drops it immediately (default: 5s)
+- `-maxdrains` - Maximum sessions concurrently flushing mirror data after their client/primary traffic has ended; `0` disables the limit (default: 1024)
 - `-shutdowntimeout` - Graceful shutdown timeout before force-closing connections (default: 30s)
 - `-statsinterval` - Interval for the aggregate `stats` log line; 0 disables it (default: 1m)
 - `-maxconns` - Maximum concurrent client connections; `0` disables the limit (default: 1024)
@@ -138,14 +146,15 @@ $ tee-rex -l :5000 -p server:5000 -m mirror:5000 -line -delim '</data>'
 - Each client connection is handled independently
 - If the primary server is unreachable, only that client connection fails
 - At most `-maxconns` connections are served concurrently (default 1024); over-limit connections are accepted and closed immediately with a logged warning. Use `-maxconns 0` to disable the limit
-- Mirror writes are asynchronous and non-blocking; a slow mirror won't affect primary traffic
+- Mirror writes are asynchronous and non-blocking; a slow mirror won't affect primary traffic. When a mirror's queue is full, the chunk is dropped before it is even copied, so an overloaded mirror costs the primary path neither allocations nor locks
+- Whatever a mirror sends back is read and discarded continuously, so a mirror that answers every request (even with responses larger than the socket buffers) keeps receiving later traffic instead of filling its send buffer and stalling
 - Mirrors automatically reconnect on failure with exponential backoff (100ms to 5s)
 - If a mirror's buffer fills up (slow consumer), data is dropped for that mirror only
 - Every dropped chunk is counted in `mirror_drops` regardless of cause (buffer full, write failure, mirror unreachable, teardown) and attributed per mirror in the session summary
 - A mirror that has never connected logs a `mirror unreachable` warning once per session, so a dead or misconfigured mirror address is visible at the default log level
 - If a mirror write fails mid-stream, the in-flight chunk is dropped (counted in `mirror_drops`) and the mirror reconnects for later data — partial writes are never replayed, so a reconnected mirror resumes on a clean boundary
-- At session end, data still queued for mirrors is flushed for up to `-mirrordrain` (default 5s) before the mirror connection closes; anything left undelivered after that is counted in `mirror_drops`. The session counts against `-maxconns` until its drain completes
-- Connections are properly cleaned up when either side disconnects; when the primary closes, the client side is torn down promptly rather than lingering until the idle timeout. When the client side ends abnormally (reset, error), the primary side is torn down promptly too
+- At session end, data still queued for mirrors is flushed for up to `-mirrordrain` (default 5s) before the mirror connection closes; anything left undelivered after that is counted in `mirror_drops`. The session's `-maxconns` slot is released as soon as its client/primary traffic is over, *before* the mirror flush, so mirror trouble never blocks new clients. Mirror flushing has its own budget (`-maxdrains`, default 1024 concurrent sessions); when it is exhausted a finishing session drops its queued mirror data (counted) instead of holding resources. A force-stopped mirror aborts promptly, including an in-flight connect/DNS lookup, so a session's mirror cleanup never takes longer than `-mirrordrain` plus one interrupted write
+- TCP half-close is relayed transparently: when one peer closes its write side (clean EOF), the other peer sees EOF, and the opposite direction keeps flowing — a primary may close its side and still read a client upload, and a client may half-close and still receive the primary's response. The session ends when the other peer also closes, or when the remaining direction carries no data for `-halfclosetimeout` (default 30s; reason `half_close_timeout`). Resets and errors on either side still tear down both directions promptly. `-halfclosetimeout 0` disables this: a primary close ends the whole session at once, and after a client close the primary may still respond until the session idle timeout
 - TCP keepalive (30s) is enabled on all connections to detect dead peers; a keepalive failure surfaces as a read error rather than being mistaken for idleness
 - Idle detection is session-wide: a session ends as idle (`session_idle`) only when *neither* direction has seen data for `-idletimeout` (default 2m). One-way traffic — e.g. a client heartbeating into a server that never responds, as in alarm-receiver protocols like FrontelGI — keeps the session alive. Idle time is measured on the monotonic clock, so NTP corrections don't disturb it
 - On SIGINT/SIGTERM, waits for active sessions to finish gracefully before force-closing; force-closed sessions end with reason `shutdown`. A second SIGINT/SIGTERM exits immediately
@@ -165,7 +174,7 @@ $ tee-rex -l :5000 -p server:5000 -m mirror:5000 -line -delim '</data>'
 
 Logs are written to stderr in structured format (key=value pairs by default, or JSON with `-logformat=json`). Use `-logfile` to append them to a file instead; `SIGHUP` reopens the file so standard logrotate setups work.
 
-Every `-statsinterval` (default 1m) an aggregate `stats` line reports active/total sessions, total bytes in/out, and mirror drops (overall and per mirror address) since process start.
+Every `-statsinterval` (default 1m) an aggregate `stats` line reports active/total sessions, total bytes in/out, and mirror drops (overall and per mirror address) since process start. The byte counters are live: they count bytes received from clients (`bytes_in`) and bytes delivered to clients (`bytes_out`) as they flow, so a long-lived session shows up while it is still open rather than only when it ends.
 
 ### Log levels
 
@@ -211,6 +220,7 @@ The `reason` field is one of:
 - `primary_eof`, `primary_reset` - primary closed or reset
 - `primary_dial_failed`, `primary_write_error`, `primary_read_error` - primary connection problems
 - `session_idle` - no data in either direction for `-idletimeout`
+- `half_close_timeout` - one peer closed its side, the other stayed open but sent nothing for `-halfclosetimeout` (`client_eof`/`primary_eof` name the peer that closed *first* when the other then finished cleanly)
 - `shutdown` - force-closed because the proxy was shutting down
 - `frame_too_large`, `partial_frame` - line-mode framing violations
 

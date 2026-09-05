@@ -110,15 +110,33 @@ jobs:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
         # -trimpath drops local paths from the binary; the ldflags stamp
-        # the same main.BuildCommit/BuildTime the Makefile uses, so
-        # `tee-rex -version` on a release asset reports the tagged build.
+        # main.Version from the tag (v1.2.3 -> 1.2.3) plus the same
+        # main.BuildCommit/BuildTime the Makefile uses, so `tee-rex -version`
+        # on a release asset reports the tagged build. The source default is
+        # "dev" and is never edited for a release.
         run: |
           mkdir -p dist
           ext=""
           if [ "${{ matrix.os }}" = "windows" ]; then ext=".exe"; fi
+          version="${GITHUB_REF_NAME#v}"
           go build -trimpath \
-            -ldflags "-X main.BuildCommit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -ldflags "-X main.Version=${version} -X main.BuildCommit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             -o dist/tee-rex-${{ matrix.os }}-${{ matrix.arch }}${ext} .
+
+      # Smoke check on the one binary this runner can execute natively: the
+      # reported version must start with the tag version. A mismatch fails
+      # this job, and assemble-release needs every build job, so nothing is
+      # published.
+      - name: Verify stamped version
+        if: matrix.os == 'linux' && matrix.arch == 'amd64'
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          out="$(./dist/tee-rex-linux-amd64 -version)"
+          echo "tee-rex -version => ${out}"
+          case "${out}" in
+            "${version}"|"${version} "*) ;;
+            *) echo "version mismatch: binary reports '${out}', tag is '${GITHUB_REF_NAME}'"; exit 1 ;;
+          esac
 
       # Stage binaries as workflow artifacts rather than uploading to
       # the release directly — assemble-release downloads all of them
